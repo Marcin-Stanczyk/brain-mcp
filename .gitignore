@@ -1,0 +1,16 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Private knowledge base — never commit the database
+data/
+
+# Private/local seed scripts (contain personal seeded knowledge / machine paths)
+scripts/seed-lessons2.cjs
+scripts/seed.cjs
+
+# Personal launchd config (public template: com.example.brain-mcp-backup.plist)
+scripts/com.marcin.brain-mcp-backup.plist
+
+# Logs
+*.log

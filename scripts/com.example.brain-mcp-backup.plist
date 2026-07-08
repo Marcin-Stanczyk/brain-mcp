@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent that runs the backup script whenever a volume is (un)mounted.
+
+  Setup:
+    1. Replace /path/to/brain-mcp below with the absolute path to your clone.
+    2. Optionally set your USB volume name via the BRAIN_BACKUP_VOLUME env key.
+    3. Install:
+       cp scripts/com.example.brain-mcp-backup.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.example.brain-mcp-backup.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.brain-mcp-backup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/path/to/brain-mcp/scripts/backup-to-usb.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BRAIN_BACKUP_VOLUME</key>
+        <string>BACKUP</string>
+    </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Volumes</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/tmp/brain-mcp-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/brain-mcp-backup.log</string>
+</dict>
+</plist>
