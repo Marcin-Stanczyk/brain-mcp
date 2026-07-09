@@ -29,18 +29,21 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 
 | File | Role |
 |------|------|
-| `src/index.ts` | Main server code — 8 MCP tools |
+| `src/index.ts` | Server entry point — wires the tools to the MCP stdio transport |
+| `src/tools.ts` | Core logic — DB setup, project scanner, the 8 MCP tools |
+| `tests/brain.test.ts` | Test suite (`node:test`, runs against a temp DB and fixture dir) |
 | `dist/index.js` | Compiled JS (what your MCP client runs) |
 | `data/knowledge.db` | SQLite database with all knowledge (WAL mode, gitignored) |
-| `package.json` | Dependencies: MCP SDK, better-sqlite3, zod, glob |
+| `package.json` | Dependencies: MCP SDK, better-sqlite3, zod (all pinned to exact versions) |
 | `tsconfig.json` | TypeScript config (ES2022, strict) |
 
-### Dependencies (minimal)
+### Dependencies (minimal, pinned to exact versions)
 
 - `@modelcontextprotocol/sdk` — the official MCP protocol implementation
 - `better-sqlite3` — native SQLite driver (fast, no async overhead)
 - `zod` — tool input validation
-- `glob` — pattern matching for the scanner
+
+Requires Node.js >= 20.
 
 ## Installation
 
@@ -183,14 +186,19 @@ Lists archived lessons and restores them back to the active set by ID.
 ### What brain-mcp does
 
 - Reads files ONLY from your code directory (metadata: `package.json`, `README.md`, `composer.json`)
+- The scanner is confined to the scan root: symlinked directories are skipped, and every file read
+  resolves symlinks first and refuses anything that lands outside `BRAIN_CODE_DIR`
+- File reads are capped at 1 MiB per file — a giant file cannot exhaust memory
 - Writes ONLY to its SQLite database (local file)
 - Communicates ONLY over stdio (stdin/stdout with the client)
 - No HTTP server, no open ports
-- Sends nothing to the internet
-- All SQL queries use prepared statements (parameterized)
-- Input validation via Zod (max 10k characters per lesson)
+- Sends nothing to the internet — the code imports no network module at all
+  (`fs`, `path`, `os`, `url`, SQLite, Zod, and the MCP stdio transport only)
+- All SQL queries use prepared statements (parameterized) — no string-interpolated SQL
+- Every tool's input is validated with Zod (length caps on all strings, bounded `limit`, enum categories)
 - LIKE queries use an ESCAPE clause (no SQL injection via wildcards)
-- `brain_forget` requires an explicit `confirm: true`
+- `brain_forget` requires an explicit `confirm: true` (Zod-enforced) — without it you only get a preview
+- All dependencies are pinned to exact versions; CI runs build + tests on Node 20 and 22
 
 ### What brain-mcp does NOT do
 
