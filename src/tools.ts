@@ -7,8 +7,12 @@ import {
   existsSync,
   mkdirSync,
   realpathSync,
+  writeFileSync,
 } from "fs";
-import { join, dirname, sep } from "path";
+import { join, dirname, sep, basename, isAbsolute, resolve } from "path";
+import { createHash } from "crypto";
+import { rrfFuse, type Embedder, type EmbeddingsConfig } from "./embeddings.js";
+import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
 
@@ -263,6 +267,38 @@ export function sanitizeFTS5Query(query: string): string {
     .join(' ');
 }
 
+// ── Export/import helpers ───────────────────────────────────────────────────
+
+/** Max bytes brain_export returns inline / brain_import reads from disk. */
+export const MAX_INLINE_EXPORT_BYTES = 64 * 1024;
+export const MAX_IMPORT_FILE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Resolve a caller-supplied export/import path and confine it to `dataDir`
+ * (same discipline as safeReadFile): the parent directory must already exist,
+ * symlinks are resolved, and anything landing outside dataDir is rejected.
+ * Returns the resolved absolute path, or null if the path is not allowed.
+ */
+export function resolveDataFilePath(requested: string, dataDir: string): string | null {
+  try {
+    const realData = realpathSync(dataDir);
+    const abs = isAbsolute(requested) ? resolve(requested) : resolve(realData, requested);
+    const name = basename(abs);
+    if (!name || name === "." || name === "..") return null;
+    const realParent = realpathSync(dirname(abs)); // parent must exist, symlinks resolved
+    const target = join(realParent, name);
+    // Must be strictly INSIDE the data dir (the dir itself is not a valid file path)
+    if (!target.startsWith(realData + sep)) return null;
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+export function contentHash(content: string): string {
+  return createHash("sha256").update(content, "utf-8").digest("hex");
+}
+
 // ── Tool definitions ────────────────────────────────────────────────────────
 
 type TextResult = { content: { type: "text"; text: string }[] };
@@ -275,8 +311,46 @@ export interface ToolDef {
   handler: (args: any) => Promise<TextResult>;
 }
 
-export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
+export interface BrainOptions {
+  /** Directory export/import files are confined to. Default: the DB's directory. */
+  dataDir?: string;
+  /** Vector index (sqlite-vec). null/undefined → FTS5-only mode. */
+  vector?: VectorIndex | null;
+  /** Embedding function. null/undefined → embeddings disabled. */
+  embedder?: Embedder | null;
+  /** Embeddings config (for status reporting). null/undefined → disabled. */
+  embeddingsConfig?: EmbeddingsConfig | null;
+}
+
+export function createTools(
+  db: Database.Database,
+  codeDir: string,
+  options: BrainOptions = {}
+): ToolDef[] {
   const tools: ToolDef[] = [];
+  const vector = options.vector ?? null;
+  const embedder = options.embedder ?? null;
+  const embeddingsConfig = options.embeddingsConfig ?? null;
+  const dataDir =
+    options.dataDir ?? (db.name && db.name !== ":memory:" ? dirname(db.name) : null);
+  const hybridEnabled = Boolean(vector && embedder);
+
+  /** Embed one lesson and store its vector. Returns true on success. */
+  const embedLesson = (id: number, content: string): Promise<boolean> => {
+    if (!vector || !embedder || !embeddingsConfig) return Promise.resolve(false);
+    return embedder(content).then(
+      (vec) => {
+        vector.upsert(id, vec, embeddingsConfig.model);
+        return true;
+      },
+      (err) => {
+        console.error(
+          `⚠️ brain-mcp: embedding failed for lesson #${id} (${err instanceof Error ? err.message : String(err)}) — saved without embedding, run brain_reindex later.`
+        );
+        return false;
+      }
+    );
+  };
 
   // Tool: Learn — store a lesson/insight/pattern
   tools.push({
@@ -331,11 +405,19 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
         severity || "info"
       );
 
+      // Optional: embed on write. Failure never blocks the save — the lesson
+      // stays unembedded and brain_reindex can pick it up later.
+      let embedNote = "";
+      if (hybridEnabled) {
+        const ok = await embedLesson(Number(result.lastInsertRowid), content);
+        embedNote = ok ? "\nEmbedded: yes" : "\nEmbedded: no (endpoint unavailable — run brain_reindex later)";
+      }
+
       return {
         content: [
           {
             type: "text" as const,
-            text: `✅ Lesson #${result.lastInsertRowid} stored [${category}] ${severity === "critical" ? "⚠️ CRITICAL" : ""}\n\nTags: ${(tags || []).join(", ") || "none"}\nProject: ${project || "general"}\n\n"${content.slice(0, 100)}${content.length > 100 ? "…" : ""}"`,
+            text: `✅ Lesson #${result.lastInsertRowid} stored [${category}] ${severity === "critical" ? "⚠️ CRITICAL" : ""}\n\nTags: ${(tags || []).join(", ") || "none"}\nProject: ${project || "general"}${embedNote}\n\n"${content.slice(0, 100)}${content.length > 100 ? "…" : ""}"`,
           },
         ],
       };
@@ -360,8 +442,15 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
       limit?: number;
     }): Promise<TextResult> => {
       let results;
+      // id → which retriever(s) found it (hybrid mode only)
+      let matchedBy: Map<number, string[]> | null = null;
+      let modeNote = "";
 
       if (query.trim()) {
+        const max = limit || 10;
+        // Over-fetch both retrievers so reciprocal rank fusion has depth to work with.
+        const fetchN = Math.min(100, max * 5);
+
         const safeQuery = sanitizeFTS5Query(query);
         let sql = `
           SELECT l.id, l.content, l.category, l.tags, l.project, l.source, l.severity, l.created_at,
@@ -383,9 +472,59 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
         }
 
         sql += ` ORDER BY rank LIMIT ?`;
-        params.push(limit || 10);
+        params.push(fetchN);
 
-        results = db.prepare(sql).all(...params);
+        const ftsRows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+
+        results = ftsRows.slice(0, max);
+
+        if (hybridEnabled) {
+          // Hybrid mode: FTS5 + KNN, merged with reciprocal rank fusion.
+          // Any embedding failure (Ollama down, model missing, dim mismatch)
+          // silently falls back to the FTS5 results computed above.
+          try {
+            const queryVec = await embedder!(query);
+            const knnHits = vector!.knn(queryVec, fetchN * 2);
+
+            const rowById = new Map<number, Record<string, unknown>>();
+            for (const row of ftsRows) rowById.set(Number(row.id), row);
+
+            const getRow = db.prepare(
+              "SELECT id, content, category, tags, project, source, severity, created_at FROM lessons WHERE id = ?"
+            );
+            const vecIds: number[] = [];
+            for (const hit of knnHits) {
+              let row = rowById.get(hit.id);
+              if (!row) {
+                row = getRow.get(hit.id) as Record<string, unknown> | undefined;
+                if (!row) continue; // stale vector for a deleted lesson
+                rowById.set(hit.id, row);
+              }
+              // Apply the same filters the FTS query used.
+              if (category && row.category !== category) continue;
+              if (
+                project &&
+                row.project !== project &&
+                !String(row.tags ?? "").includes(`"${project}"`)
+              ) continue;
+              vecIds.push(hit.id);
+              if (vecIds.length >= fetchN) break;
+            }
+
+            const fused = rrfFuse([
+              { retriever: "fts", ids: ftsRows.map((r) => Number(r.id)) },
+              { retriever: "vector", ids: vecIds },
+            ]).slice(0, max);
+
+            results = fused.map((h) => rowById.get(h.id)).filter(Boolean) as Record<string, unknown>[];
+            matchedBy = new Map(fused.map((h) => [h.id, h.retrievers]));
+            modeNote = " (hybrid: FTS5 + vector, RRF-fused)";
+          } catch (err) {
+            console.error(
+              `⚠️ brain-mcp: hybrid recall degraded to FTS5-only (${err instanceof Error ? err.message : String(err)})`
+            );
+          }
+        }
       } else {
         let sql = `SELECT * FROM lessons WHERE 1=1`;
         const params: (string | number)[] = [];
@@ -414,11 +553,13 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
 
       const formatted = (results as Record<string, unknown>[]).map((r) => {
         const sev = r.severity === "critical" ? "🔴" : r.severity === "important" ? "🟡" : "🔵";
-        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${r.content}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}`;
+        const via = matchedBy?.get(Number(r.id));
+        const viaNote = via ? ` | matched: ${via.join("+")}` : "";
+        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${r.content}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}`;
       }).join("\n\n---\n\n");
 
       return {
-        content: [{ type: "text" as const, text: `Found ${results.length} lessons:\n\n${formatted}` }],
+        content: [{ type: "text" as const, text: `Found ${results.length} lessons${modeNote}:\n\n${formatted}` }],
       };
     },
   });
@@ -551,6 +692,30 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
       output += `| Patterns | ${patterns.count} |\n`;
       output += `| Projects indexed | ${projects.count} |\n\n`;
 
+      // Embeddings / vector search status
+      output += `### Embeddings\n`;
+      if (!embeddingsConfig) {
+        output += `Mode: disabled (set BRAIN_EMBEDDINGS_URL to enable hybrid search — see README)\n\n`;
+      } else if (!vector) {
+        output += `Mode: enabled (${embeddingsConfig.model}) but vector index unavailable — sqlite-vec failed to load, running FTS5-only\n\n`;
+      } else {
+        let reachable = false;
+        if (embedder) {
+          try {
+            await embedder("ping");
+            reachable = true;
+          } catch { /* unreachable */ }
+        }
+        const embedded = vector.embeddedCount();
+        const unembedded = lessons.count - embedded;
+        output += reachable
+          ? `Mode: enabled (${embeddingsConfig.model} @ ${embeddingsConfig.url})\n`
+          : `Mode: enabled (${embeddingsConfig.model} @ ${embeddingsConfig.url}) — endpoint UNREACHABLE, recall falls back to FTS5-only\n`;
+        output += `Embedded lessons: ${embedded} | Unembedded: ${unembedded}`;
+        if (unembedded > 0) output += ` (run brain_reindex to embed them)`;
+        output += `\n\n`;
+      }
+
       if (byCat.length) {
         output += `### By Category\n`;
         for (const c of byCat) {
@@ -636,7 +801,7 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
         } else if (project) {
           rows = db.prepare("SELECT * FROM lessons WHERE project = ?").all(project) as Record<string, unknown>[];
         } else {
-          return 0;
+          return [] as number[];
         }
 
         const insertArchive = db.prepare(`
@@ -650,13 +815,20 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
           deleteLesson.run(row.id);
         }
 
-        return rows.length;
+        return rows.map((row) => Number(row.id));
       });
 
-      const archived = archiveAndDelete();
+      const archivedIds = archiveAndDelete();
+      if (vector && archivedIds.length) {
+        try {
+          vector.remove(archivedIds);
+        } catch (err) {
+          console.error(`⚠️ brain-mcp: failed to drop vectors for archived lessons (${err instanceof Error ? err.message : String(err)})`);
+        }
+      }
 
       return {
-        content: [{ type: "text" as const, text: `📦 Archived ${archived} lesson(s) → lessons_archive table.\nReason: ${reason}\n\nData is preserved and can be restored.` }],
+        content: [{ type: "text" as const, text: `📦 Archived ${archivedIds.length} lesson(s) → lessons_archive table.\nReason: ${reason}\n\nData is preserved and can be restored.` }],
       };
     },
   });
@@ -711,6 +883,251 @@ export function createTools(db: Database.Database, codeDir: string): ToolDef[] {
       if (!restored) return { content: [{ type: "text" as const, text: `No archived lesson with id=${id}.` }] };
 
       return { content: [{ type: "text" as const, text: `✅ Restored lesson #${id} back to active lessons.` }] };
+    },
+  });
+
+  // Tool: Reindex embeddings
+  tools.push({
+    name: "brain_reindex",
+    description:
+      "Batch-embed all lessons that have no vector embedding yet (requires BRAIN_EMBEDDINGS_URL). With force:true, drops the vector index and re-embeds everything — use after changing the embedding model.",
+    schema: {
+      force: z.boolean().optional().default(false).describe("Re-embed ALL lessons, not just unembedded ones"),
+    },
+    handler: async ({ force }: { force?: boolean }): Promise<TextResult> => {
+      if (!embeddingsConfig || !embedder) {
+        return { content: [{ type: "text" as const, text: "Embeddings are disabled. Set BRAIN_EMBEDDINGS_URL (e.g. http://localhost:11434 for a local Ollama) to enable hybrid search." }] };
+      }
+      if (!vector) {
+        return { content: [{ type: "text" as const, text: "Vector index unavailable — the sqlite-vec extension failed to load on this platform. Search runs FTS5-only." }] };
+      }
+
+      const pruned = vector.pruneOrphans();
+      if (force) vector.clear();
+
+      const ids = vector.unembeddedLessonIds();
+      const getContent = db.prepare("SELECT content FROM lessons WHERE id = ?");
+
+      let embedded = 0;
+      let failed = 0;
+      let consecutiveFailures = 0;
+      const MAX_CONSECUTIVE_FAILURES = 3;
+      let aborted = false;
+
+      for (const id of ids) {
+        const row = getContent.get(id) as { content: string } | undefined;
+        if (!row) continue;
+        const ok = await embedLesson(id, row.content);
+        if (ok) {
+          embedded++;
+          consecutiveFailures = 0;
+        } else {
+          failed++;
+          consecutiveFailures++;
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            aborted = true;
+            break;
+          }
+        }
+      }
+
+      const remaining = vector.unembeddedLessonIds().length;
+      let text = `🔁 Reindex ${aborted ? "ABORTED (embeddings endpoint appears down)" : "complete"} (model: ${embeddingsConfig.model}${force ? ", force" : ""})\n\n`;
+      text += `Embedded: ${embedded}/${ids.length}\n`;
+      if (failed) text += `Failed: ${failed}\n`;
+      if (pruned) text += `Pruned orphaned vectors: ${pruned}\n`;
+      text += `Still unembedded: ${remaining}`;
+      return { content: [{ type: "text" as const, text }] };
+    },
+  });
+
+  // Tool: Export the knowledge base
+  tools.push({
+    name: "brain_export",
+    description:
+      "Export the knowledge base. format:'json' is lossless (re-importable via brain_import); format:'markdown' is human-readable, grouped by category. Writes to a path inside the data directory, or returns inline when no path is given (size-capped).",
+    schema: {
+      format: z.enum(["json", "markdown"]).optional().default("json").describe("Export format"),
+      path: z.string().min(1).max(500).optional().describe("Output file path (relative to the data directory; must stay inside it). Omit to get the export inline."),
+    },
+    handler: async ({ format, path }: { format?: "json" | "markdown"; path?: string }): Promise<TextResult> => {
+      const lessons = db.prepare("SELECT id, category, tags, content, source, project, severity, created_at, updated_at FROM lessons ORDER BY id").all() as Record<string, unknown>[];
+      const patterns = db.prepare("SELECT id, pattern_type, name, description, example, projects, created_at FROM patterns ORDER BY id").all() as Record<string, unknown>[];
+
+      const parseJSON = (s: unknown): unknown => {
+        try { return JSON.parse(String(s)); } catch { return s; }
+      };
+
+      let payload: string;
+      if (format === "markdown") {
+        const byCategory = new Map<string, Record<string, unknown>[]>();
+        for (const l of lessons) {
+          const cat = String(l.category);
+          if (!byCategory.has(cat)) byCategory.set(cat, []);
+          byCategory.get(cat)!.push(l);
+        }
+        let md = `# Brain export\n\nExported: ${new Date().toISOString()}\nLessons: ${lessons.length} | Patterns: ${patterns.length}\n`;
+        for (const [cat, items] of [...byCategory.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+          md += `\n## ${cat} (${items.length})\n`;
+          for (const l of items) {
+            md += `\n### #${l.id} — ${l.severity}${l.project ? ` (${l.project})` : ""}\n\n${l.content}\n\n`;
+            const tags = parseJSON(l.tags);
+            if (Array.isArray(tags) && tags.length) md += `Tags: ${tags.join(", ")}\n`;
+            if (l.source) md += `Source: ${l.source}\n`;
+            md += `Created: ${l.created_at}\n`;
+          }
+        }
+        if (patterns.length) {
+          md += `\n## Patterns (${patterns.length})\n`;
+          for (const p of patterns) {
+            md += `\n### ${p.name} [${p.pattern_type}]\n\n${p.description}\n`;
+            if (p.example) md += `\n\`\`\`\n${p.example}\n\`\`\`\n`;
+            const projs = parseJSON(p.projects);
+            if (Array.isArray(projs) && projs.length) md += `Projects: ${projs.join(", ")}\n`;
+          }
+        }
+        payload = md;
+      } else {
+        payload = JSON.stringify(
+          {
+            brain_export_version: 1,
+            exported_at: new Date().toISOString(),
+            lessons: lessons.map((l) => ({ ...l, tags: parseJSON(l.tags) })),
+            patterns: patterns.map((p) => ({ ...p, projects: parseJSON(p.projects) })),
+          },
+          null,
+          2
+        );
+      }
+
+      if (path) {
+        if (!dataDir) {
+          return { content: [{ type: "text" as const, text: "❌ No data directory configured — cannot write export files." }] };
+        }
+        const target = resolveDataFilePath(path, dataDir);
+        if (!target) {
+          return { content: [{ type: "text" as const, text: `❌ Refused: export path must stay inside the data directory (${dataDir}) and its parent must exist.` }] };
+        }
+        // Never overwrite the live database files.
+        const dbBase = basename(db.name);
+        if ([dbBase, `${dbBase}-wal`, `${dbBase}-shm`].includes(basename(target))) {
+          return { content: [{ type: "text" as const, text: "❌ Refused: export path collides with the database file." }] };
+        }
+        writeFileSync(target, payload, "utf-8");
+        return { content: [{ type: "text" as const, text: `✅ Exported ${lessons.length} lessons and ${patterns.length} patterns (${format}) → ${target}` }] };
+      }
+
+      if (Buffer.byteLength(payload, "utf-8") > MAX_INLINE_EXPORT_BYTES) {
+        return { content: [{ type: "text" as const, text: `Export is larger than ${MAX_INLINE_EXPORT_BYTES} bytes — pass a path (inside the data directory) to write it to a file instead.` }] };
+      }
+      return { content: [{ type: "text" as const, text: payload }] };
+    },
+  });
+
+  // Tool: Import a JSON export
+  tools.push({
+    name: "brain_import",
+    description:
+      "Import lessons and patterns from a JSON file produced by brain_export (file must live inside the data directory). Duplicates are skipped by content hash.",
+    schema: {
+      path: z.string().min(1).max(500).describe("JSON export file path (relative to the data directory)"),
+    },
+    handler: async ({ path }: { path: string }): Promise<TextResult> => {
+      if (!dataDir) {
+        return { content: [{ type: "text" as const, text: "❌ No data directory configured — cannot read import files." }] };
+      }
+      const target = resolveDataFilePath(path, dataDir);
+      if (!target) {
+        return { content: [{ type: "text" as const, text: `❌ Refused: import path must stay inside the data directory (${dataDir}).` }] };
+      }
+
+      let parsed: { brain_export_version?: number; lessons?: unknown; patterns?: unknown };
+      try {
+        const st = statSync(target);
+        if (!st.isFile() || st.size > MAX_IMPORT_FILE_BYTES) {
+          return { content: [{ type: "text" as const, text: `❌ Import file missing, not a regular file, or larger than ${MAX_IMPORT_FILE_BYTES} bytes.` }] };
+        }
+        parsed = JSON.parse(readFileSync(target, "utf-8"));
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `❌ Could not read import file: ${err instanceof Error ? err.message : String(err)}` }] };
+      }
+      if (parsed.brain_export_version !== 1 || !Array.isArray(parsed.lessons)) {
+        return { content: [{ type: "text" as const, text: "❌ Not a brain_export JSON file (expected brain_export_version: 1 with a lessons array)." }] };
+      }
+
+      const existingHashes = new Set(
+        (db.prepare("SELECT content FROM lessons").all() as { content: string }[])
+          .map((r) => contentHash(r.content))
+      );
+      const existingPatternKeys = new Set(
+        (db.prepare("SELECT pattern_type, name, description FROM patterns").all() as Record<string, string>[])
+          .map((r) => contentHash(`${r.pattern_type} ${r.name} ${r.description}`))
+      );
+
+      const lessonSchema = z.object({
+        content: z.string().min(1).max(10000),
+        category: z.string().min(1).max(100),
+        tags: z.array(z.string().max(100)).max(50).optional(),
+        project: z.string().max(200).nullish(),
+        source: z.string().max(500).nullish(),
+        severity: z.string().max(50).nullish(),
+        created_at: z.string().max(50).nullish(),
+      });
+      const patternSchema = z.object({
+        pattern_type: z.string().min(1).max(100),
+        name: z.string().min(1).max(200),
+        description: z.string().min(1).max(5000),
+        example: z.string().max(10000).nullish(),
+        projects: z.array(z.string().max(200)).max(100).optional(),
+      });
+
+      let inserted = 0, skippedDupes = 0, skippedInvalid = 0, patternsInserted = 0;
+      const insertLesson = db.prepare(`
+        INSERT INTO lessons (content, category, tags, project, source, severity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+      `);
+      const insertPattern = db.prepare(`
+        INSERT INTO patterns (pattern_type, name, description, example, projects)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+
+      const runImport = db.transaction(() => {
+        for (const raw of parsed.lessons as unknown[]) {
+          const l = lessonSchema.safeParse(raw);
+          if (!l.success) { skippedInvalid++; continue; }
+          const hash = contentHash(l.data.content);
+          if (existingHashes.has(hash)) { skippedDupes++; continue; }
+          existingHashes.add(hash);
+          insertLesson.run(
+            l.data.content,
+            l.data.category,
+            JSON.stringify(l.data.tags || []),
+            l.data.project ?? null,
+            l.data.source ?? null,
+            l.data.severity ?? "info",
+            l.data.created_at ?? null
+          );
+          inserted++;
+        }
+        if (Array.isArray(parsed.patterns)) {
+          for (const raw of parsed.patterns as unknown[]) {
+            const p = patternSchema.safeParse(raw);
+            if (!p.success) { skippedInvalid++; continue; }
+            const key = contentHash(`${p.data.pattern_type} ${p.data.name} ${p.data.description}`);
+            if (existingPatternKeys.has(key)) { skippedDupes++; continue; }
+            existingPatternKeys.add(key);
+            insertPattern.run(p.data.pattern_type, p.data.name, p.data.description, p.data.example ?? null, JSON.stringify(p.data.projects || []));
+            patternsInserted++;
+          }
+        }
+      });
+      runImport();
+
+      let text = `📥 Import complete from ${target}\n\n`;
+      text += `Lessons inserted: ${inserted}\nPatterns inserted: ${patternsInserted}\nSkipped (duplicate content hash): ${skippedDupes}\n`;
+      if (skippedInvalid) text += `Skipped (invalid entries): ${skippedInvalid}\n`;
+      if (inserted && hybridEnabled) text += `\nImported lessons are not embedded yet — run brain_reindex to embed them.`;
+      return { content: [{ type: "text" as const, text }] };
     },
   });
 
