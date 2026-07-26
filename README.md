@@ -50,7 +50,8 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `src/vector.ts` | sqlite-vec vector index (loads the extension, degrades gracefully) |
 | `src/resources.ts` | MCP resources: `brain://lessons/{id}`, `brain://projects/{name}` |
 | `hooks/session_context.py` | `SessionStart` hook — injects this project's lessons (reads SQLite read-only) |
-| `hooks/capture_lesson.py` | `Stop` hook — asks once for a lesson when the session wrote none |
+| `hooks/capture_lesson.py` | `Stop` hook — asks once for a lesson, naming the incidents that were recorded |
+| `hooks/incident_watch.py` | `PostToolUse` hook — catches undo commands and repeat failures as they happen |
 | `scripts/install-hooks.mjs` | Registers/removes the hooks in Claude Code settings (merging, idempotent) |
 | `scripts/import-claude-memory.py` | Imports Claude Code's `memory/*.md` files into the indexed store |
 | `tests/*.test.ts` | Test suites (`node:test`, temp DBs, fixture dirs, mocked embeddings HTTP) |
@@ -93,12 +94,29 @@ The database is created automatically on first run (default: `data/knowledge.db`
 
 ### What the hooks do
 
-`npm run setup` (or `npm run hooks:install`) adds two entries to `~/.claude/settings.json`:
+`npm run setup` (or `npm run hooks:install`) registers these in `~/.claude/settings.json`:
 
 | Hook | Script | Effect |
 |------|--------|--------|
-| `SessionStart` | `hooks/session_context.py` | Reads the database directly and injects this project's lessons — criticals first — before the first token. Also flags when a [graphify](https://github.com/Graphify-Labs/graphify) code graph exists, so the agent queries the graph instead of grepping. |
-| `Stop` | `hooks/capture_lesson.py` | If the session wrote nothing, asks **once** for a lesson. This is what turns an occasional scratchpad into a feedback loop. |
+| `SessionStart` | `hooks/session_context.py` | Reads the database directly and injects this project's lessons — criticals first — before the first token. Also injects `critical` lessons from `BRAIN_HOOK_GLOBAL_PROJECTS` regardless of directory, and flags when a [graphify](https://github.com/Graphify-Labs/graphify) code graph exists so the agent queries the graph instead of grepping. |
+| `PostToolUse` / `PostToolUseFailure` | `hooks/incident_watch.py` | Watches Bash for the moment a mistake becomes visible: an undo command (`git checkout --`, `restore`, `reset --hard`, `revert`, `clean`, `stash drop`, `commit --amend`, restoring a `.bak`) or the same command failing repeatedly. Undos prompt for a lesson **immediately**, while the cause is still known; repeat failures are logged silently. |
+| `Stop` | `hooks/capture_lesson.py` | If the session wrote nothing, asks **once** for a lesson — naming the specific incidents `incident_watch` recorded, rather than asking "did you learn anything". |
+
+### Why capture at the moment, not at the end
+
+The most valuable lesson is a mistake made and corrected mid-session, and that is
+exactly the one a session-end prompt misses. By the time the turn ends the
+evidence has scrolled away and the model reconstructs it from memory — or the
+session already recorded something unrelated, so the prompt never fires at all.
+
+`incident_watch.py` optimises for precision over recall, because a hook that
+nags gets disabled. It only fires on undo commands, where the base rate of "an
+actual mistake happened" is close to 1 — nobody reverts unless something went
+wrong. Routine commands (`git status`, `git add`, `git diff`, `npm test`) stay
+silent. A single failed command stays silent too; it is usually a typo, not a
+lesson. Both prompts ask for the same four-part shape — PROBLEM, CAUSE, FIX,
+VERIFY — so the recorded lesson carries the mechanism and the check that would
+catch it earlier, not just a description of the symptom.
 
 Hooks cannot call MCP tools — a hook is a separate process, MCP is JSON-RPC inside the agent's session. So `SessionStart` opens the SQLite file read-only. That is also cheaper than a tool call: zero model round-trips, and the knowledge is simply present from the start.
 
@@ -122,6 +140,8 @@ The installer **merges** into your settings: it identifies its own entries by th
 | `BRAIN_HOOK_MAX_LESSONS` | `12` | Lessons injected at session start |
 | `BRAIN_HOOK_MAX_CHARS` | `4000` | Hard cap on the injected block, so the hook can never balloon your context |
 | `BRAIN_HOOK_MIN_SECONDS` | `180` | Sessions shorter than this are never asked for a lesson |
+| `BRAIN_HOOK_GLOBAL_PROJECTS` | `claude-code-setup` | Comma-separated projects whose `critical` lessons are injected in every session, whatever the directory. Tooling traps belong here — a lesson filed under one project is invisible in the others, including the ones where the mistake would recur. Set to `""` to disable. |
+| `BRAIN_HOOK_MAX_GLOBAL` | `4` | Cap on those cross-cutting entries |
 
 Typical cost of the `SessionStart` injection is 600–850 tokens on a project with real history — roughly one avoided re-investigation pays for a month of it.
 

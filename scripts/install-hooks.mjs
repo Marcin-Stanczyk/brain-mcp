@@ -31,6 +31,10 @@ const HOOKS_DIR = join(REPO, 'hooks');
 const HOOKS = [
   { event: 'SessionStart', file: 'session_context.py', timeout: 10 },
   { event: 'Stop', file: 'capture_lesson.py', timeout: 10 },
+  // Catch mistakes as they happen, not at session end. Scoped to Bash: the
+  // signals are shell-level (an undo command ran, a command kept failing).
+  { event: 'PostToolUse', file: 'incident_watch.py', timeout: 5, matcher: 'Bash' },
+  { event: 'PostToolUseFailure', file: 'incident_watch.py', timeout: 5, matcher: 'Bash' },
 ];
 
 const argv = process.argv.slice(2);
@@ -106,13 +110,15 @@ function main() {
     if (removed) changed += removed;
 
     if (!UNINSTALL) {
-      kept.push({
+      const group = {
         hooks: [{
           type: 'command',
           command: `${py} ${JSON.stringify(join(HOOKS_DIR, h.file))}`,
           timeout: h.timeout,
         }],
-      });
+      };
+      if (h.matcher) group.matcher = h.matcher;
+      kept.push(group);
       changed += 1;
     }
 

@@ -29,7 +29,7 @@ DB = os.environ.get("BRAIN_DB") or os.path.join(_REPO, "data", "knowledge.db")
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
 MIN_SECONDS = int(os.environ.get("BRAIN_HOOK_MIN_SECONDS", "180"))
 
-PROMPT = (
+GENERIC_PROMPT = (
     "Nothing was written to brain-mcp this session. If you learned something "
     "non-obvious — a trap in the code, an architectural decision, an external "
     "API constraint, a repeatable pattern — record it now with brain_learn "
@@ -37,6 +37,48 @@ PROMPT = (
     "already visible in the code, in git history, or in CLAUDE.md. If there "
     "genuinely was nothing worth keeping, say so in one sentence and finish."
 )
+
+INCIDENT_PROMPT = (
+    "This session hit {n} incident(s) and recorded nothing to brain-mcp:\n"
+    "\n{listing}\n"
+    "\nEach of those is a mistake that was noticed and worked around. That is "
+    "exactly the knowledge that disappears if it is not written down — and the "
+    "evidence is still in this session, but will not be in the next one.\n"
+    "\nFor any that had a cause which could repeat, call brain_learn using:\n"
+    "  PROBLEM  — what went wrong, observably\n"
+    "  CAUSE    — the mechanism, not the symptom\n"
+    "  FIX      — what actually resolved it\n"
+    "  VERIFY   — the check that proved it, and would have caught it earlier\n"
+    "\nUse severity=critical if it could destroy work again, and "
+    "project=claude-code-setup for tooling lessons (those surface in every "
+    "session regardless of directory).\n"
+    "\nIf every one of them was routine, say so in one sentence and finish."
+)
+
+
+def read_incidents(session_id):
+    p = os.path.join(STATE_DIR, f"{session_id}-incidents.jsonl")
+    if not os.path.exists(p):
+        return []
+    out = []
+    try:
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    except Exception:
+        return out
+    return out
+
+
+def describe(inc):
+    if inc.get("kind") == "revert":
+        return f"  - undo ran ({inc.get('label')}): {inc.get('meaning')}\n" \
+               f"      {str(inc.get('cmd',''))[:140]}"
+    if inc.get("kind") == "retry":
+        return f"  - command failed {inc.get('count')}x before moving on:\n" \
+               f"      {str(inc.get('cmd',''))[:140]}"
+    return f"  - {inc}"
 
 
 def lessons_count() -> int:
@@ -105,7 +147,19 @@ def main():
         # If the marker can't be flagged we would risk asking again — don't ask.
         return
 
-    print(json.dumps({"decision": "block", "reason": PROMPT}))
+    # Prefer the evidence-based prompt: naming the actual incidents produces a
+    # far better lesson than asking "did you learn anything", because the model
+    # is reminded of a specific event instead of scanning the whole session.
+    incidents = read_incidents(sid)
+    if incidents:
+        listing = "\n".join(describe(i) for i in incidents[:6])
+        if len(incidents) > 6:
+            listing += f"\n  - …and {len(incidents) - 6} more"
+        reason = INCIDENT_PROMPT.format(n=len(incidents), listing=listing)
+    else:
+        reason = GENERIC_PROMPT
+
+    print(json.dumps({"decision": "block", "reason": reason}))
 
 
 if __name__ == "__main__":
