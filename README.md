@@ -49,6 +49,10 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `src/embeddings.ts` | Optional embeddings client (Ollama) + reciprocal rank fusion |
 | `src/vector.ts` | sqlite-vec vector index (loads the extension, degrades gracefully) |
 | `src/resources.ts` | MCP resources: `brain://lessons/{id}`, `brain://projects/{name}` |
+| `hooks/session_context.py` | `SessionStart` hook — injects this project's lessons (reads SQLite read-only) |
+| `hooks/capture_lesson.py` | `Stop` hook — asks once for a lesson when the session wrote none |
+| `scripts/install-hooks.mjs` | Registers/removes the hooks in Claude Code settings (merging, idempotent) |
+| `scripts/import-claude-memory.py` | Imports Claude Code's `memory/*.md` files into the indexed store |
 | `tests/*.test.ts` | Test suites (`node:test`, temp DBs, fixture dirs, mocked embeddings HTTP) |
 | `dist/index.js` | Compiled JS (what your MCP client runs) |
 | `data/knowledge.db` | SQLite database with all knowledge (WAL mode, gitignored) |
@@ -66,14 +70,71 @@ Requires Node.js >= 20.
 
 ## Installation
 
+### Recommended setup — read this first
+
+A knowledge base only pays off if something **writes to it** and something **reads it back**. Register the MCP server alone and you get a passive store: the tools exist, but nothing reminds anyone to use them. In practice that means lessons trickle in at well under one per day and the agent starts most sessions blind to what it already learned.
+
+Three steps close the loop:
+
 ```bash
+# 1 — build
 git clone <this repo> brain-mcp
 cd brain-mcp
 npm install
-npm run build
+
+# 2 — build + register the lifecycle hooks in Claude Code
+npm run setup
+
+# 3 — register the MCP server itself (see the client sections below)
+claude mcp add brain-mcp -- node "$(pwd)/dist/index.js"
 ```
 
 The database is created automatically on first run (default: `data/knowledge.db` inside the repo).
+
+### What the hooks do
+
+`npm run setup` (or `npm run hooks:install`) adds two entries to `~/.claude/settings.json`:
+
+| Hook | Script | Effect |
+|------|--------|--------|
+| `SessionStart` | `hooks/session_context.py` | Reads the database directly and injects this project's lessons — criticals first — before the first token. Also flags when a [graphify](https://github.com/Graphify-Labs/graphify) code graph exists, so the agent queries the graph instead of grepping. |
+| `Stop` | `hooks/capture_lesson.py` | If the session wrote nothing, asks **once** for a lesson. This is what turns an occasional scratchpad into a feedback loop. |
+
+Hooks cannot call MCP tools — a hook is a separate process, MCP is JSON-RPC inside the agent's session. So `SessionStart` opens the SQLite file read-only. That is also cheaper than a tool call: zero model round-trips, and the knowledge is simply present from the start.
+
+Both hooks **fail open**. Any error exits 0 with no output, so a broken hook can never stop a session from starting or trap one in a loop. The `Stop` hook additionally guards against loops four ways: it respects `stop_hook_active`, blocks at most once per session (tracked by a per-session marker), stays quiet for sessions under `BRAIN_HOOK_MIN_SECONDS`, and never asks when the lesson count already grew.
+
+```bash
+npm run hooks:status      # show what is registered, write nothing
+npm run hooks:install     # idempotent — re-run after moving the repo
+npm run hooks:uninstall   # clean removal
+node scripts/install-hooks.mjs --project   # register in ./.claude/settings.json instead
+```
+
+The installer **merges** into your settings: it identifies its own entries by the absolute path to this repo's `hooks/` directory, so it leaves any other hooks you have alone, and `--uninstall` removes exactly its own. It backs up `settings.json` before the first change and never touches your database.
+
+> Setup is a deliberate opt-in rather than an automatic `postinstall`. `npm run setup` writes to `~/.claude/settings.json` — a file outside this project — and a package that modifies your global agent configuration as a side effect of `npm install` is not a package you should trust. One command, run knowingly.
+
+### Tuning the hooks (environment variables)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `BRAIN_HOOK_MAX_LESSONS` | `12` | Lessons injected at session start |
+| `BRAIN_HOOK_MAX_CHARS` | `4000` | Hard cap on the injected block, so the hook can never balloon your context |
+| `BRAIN_HOOK_MIN_SECONDS` | `180` | Sessions shorter than this are never asked for a lesson |
+
+Typical cost of the `SessionStart` injection is 600–850 tokens on a project with real history — roughly one avoided re-investigation pays for a month of it.
+
+### Optional — import existing Claude Code memory
+
+Claude Code writes its own per-project memories as markdown under `~/.claude/projects/<project>/memory/`. Those files have **no search index**; an agent finds them only when `MEMORY.md` happens to land in context. If you have accumulated any, move the content into the indexed store:
+
+```bash
+python3 scripts/import-claude-memory.py --dry-run
+python3 scripts/import-claude-memory.py
+```
+
+The markdown files are left in place — this copies content, it does not migrate. It is idempotent (keyed on `source`), so re-running updates changed files and skips the rest. Pass `--code-root` if your projects do not live in `~/code`, and `--client-group <folder>` for folders holding client work.
 
 ### Configuration (environment variables)
 

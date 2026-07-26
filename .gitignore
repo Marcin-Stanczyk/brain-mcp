@@ -12,5 +12,9 @@ scripts/seed.cjs
 # Personal launchd config (public template: com.example.brain-mcp-backup.plist)
 scripts/com.marcin.brain-mcp-backup.plist
 
+# Python bytecode (from scripts/*.py)
+__pycache__/
+*.pyc
+
 # Logs
 *.log
