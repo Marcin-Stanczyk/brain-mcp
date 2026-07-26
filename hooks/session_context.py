@@ -30,6 +30,12 @@ DB = os.environ.get("BRAIN_DB") or os.path.join(_REPO, "data", "knowledge.db")
 
 MAX_LESSONS = int(os.environ.get("BRAIN_HOOK_MAX_LESSONS", "12"))
 MAX_CHARS = int(os.environ.get("BRAIN_HOOK_MAX_CHARS", "4000"))
+# Projects whose `critical` lessons are cross-cutting and injected in every
+# session regardless of cwd — tooling traps, harness rules, destructive-command
+# lessons. Comma-separated. Set to "" to disable.
+GLOBAL_PROJECTS = [p for p in os.environ.get(
+    "BRAIN_HOOK_GLOBAL_PROJECTS", "claude-code-setup").split(",") if p.strip()]
+MAX_GLOBAL_CRITICALS = int(os.environ.get("BRAIN_HOOK_MAX_GLOBAL", "4"))
 SNIPPET_CHARS = 220
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
 
@@ -70,20 +76,40 @@ def connect_ro():
 
 
 def fetch_lessons(project: str):
+    """Lessons for this project, plus cross-cutting criticals from anywhere.
+
+    Project-scoped recall alone has a blind spot: a critical lesson about
+    tooling ("never propagate an edit with cp") gets filed under whatever
+    project was open when it was learned, and is then invisible everywhere
+    else — including the projects where the mistake would actually recur.
+    Criticals from GLOBAL_PROJECTS are therefore injected regardless of cwd.
+    """
     con = connect_ro()
     if con is None:
         return []
     try:
         # The second clause makes git worktrees inherit the parent project's
         # lessons: cwd "myapp-hotfix" still matches project "myapp".
-        return con.execute(
-            "SELECT category, content, severity FROM lessons "
+        rows = con.execute(
+            "SELECT category, content, severity, project FROM lessons "
             "WHERE project = ? OR ? LIKE project || '%' "
             "ORDER BY CASE severity WHEN 'critical' THEN 0 "
             "WHEN 'important' THEN 1 WHEN 'high' THEN 1 ELSE 2 END, "
             "updated_at DESC LIMIT ?",
             (project, project, MAX_LESSONS),
         ).fetchall()
+        seen = {r[1] for r in rows}
+        room = max(0, MAX_LESSONS + MAX_GLOBAL_CRITICALS - len(rows))
+        if room and GLOBAL_PROJECTS:
+            marks = ",".join("?" * len(GLOBAL_PROJECTS))
+            extra = con.execute(
+                f"SELECT category, content, severity, project FROM lessons "
+                f"WHERE severity = 'critical' AND project IN ({marks}) "
+                f"ORDER BY updated_at DESC LIMIT ?",
+                (*GLOBAL_PROJECTS, min(room, MAX_GLOBAL_CRITICALS)),
+            ).fetchall()
+            rows += [r for r in extra if r[1] not in seen]
+        return rows
     except Exception:
         return []
     finally:
@@ -132,10 +158,13 @@ def main():
             "Knowledge from earlier sessions. Verify before acting on it — it may "
             "be stale relative to the current code."
         )
-        for cat, content, sev in lessons:
+        for cat, content, sev, proj in lessons:
             flag = "!" if sev in ("critical", "important", "high") else "-"
+            # mark cross-cutting criticals so they aren't mistaken for
+            # something specific to the project currently open
+            tag = f"[{cat}]" if proj == project else f"[{cat} · {proj}]"
             one = " ".join(str(content).split())[:SNIPPET_CHARS]
-            parts.append(f"{flag} [{cat}] {one}")
+            parts.append(f"{flag} {tag} {one}")
         parts.append(
             "\nUse `brain_recall` to read any of these in full, and `brain_learn` "
             "to record anything non-obvious you discover this session."
