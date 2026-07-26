@@ -122,6 +122,27 @@ Hooks cannot call MCP tools — a hook is a separate process, MCP is JSON-RPC in
 
 Both hooks **fail open**. Any error exits 0 with no output, so a broken hook can never stop a session from starting or trap one in a loop. The `Stop` hook additionally guards against loops four ways: it respects `stop_hook_active`, blocks at most once per session (tracked by a per-session marker), stays quiet for sessions under `BRAIN_HOOK_MIN_SECONDS`, and never asks when the lesson count already grew.
 
+### Cross-cutting lessons
+
+A lesson is stored against a project, and `SessionStart` normally injects only
+the current project's. That leaves a gap: a `critical` lesson about tooling —
+"this command silently overwrites a newer file" — is filed under whichever
+project was open when it was learned, and is then invisible in every other
+project, including the ones where the mistake would recur.
+
+Nominate one or more projects whose criticals should follow you everywhere:
+
+```bash
+npm run hooks:install -- --global-projects tooling
+# or several:  --global-projects tooling,infra
+```
+
+The value is written into the hook command in *your* `settings.json`, not into
+this repo — which projects are cross-cutting is a property of your knowledge
+base, not of this engine. Those entries are tagged `[category · project]` in the
+injection so they are not mistaken for something local, and capped at
+`BRAIN_HOOK_MAX_GLOBAL`.
+
 ```bash
 npm run hooks:status      # show what is registered, write nothing
 npm run hooks:install     # idempotent — re-run after moving the repo
@@ -140,7 +161,7 @@ The installer **merges** into your settings: it identifies its own entries by th
 | `BRAIN_HOOK_MAX_LESSONS` | `12` | Lessons injected at session start |
 | `BRAIN_HOOK_MAX_CHARS` | `4000` | Hard cap on the injected block, so the hook can never balloon your context |
 | `BRAIN_HOOK_MIN_SECONDS` | `180` | Sessions shorter than this are never asked for a lesson |
-| `BRAIN_HOOK_GLOBAL_PROJECTS` | `claude-code-setup` | Comma-separated projects whose `critical` lessons are injected in every session, whatever the directory. Tooling traps belong here — a lesson filed under one project is invisible in the others, including the ones where the mistake would recur. Set to `""` to disable. |
+| `BRAIN_HOOK_GLOBAL_PROJECTS` | *(empty — off)* | Comma-separated projects whose `critical` lessons are injected in every session, whatever the directory. Tooling traps belong here: a lesson filed under one project is invisible in the others, including the ones where the mistake would recur. Set it with `--global-projects` at install time (see below) rather than editing this repo. |
 | `BRAIN_HOOK_MAX_GLOBAL` | `4` | Cap on those cross-cutting entries |
 
 Typical cost of the `SessionStart` injection is 600–850 tokens on a project with real history — roughly one avoided re-investigation pays for a month of it.

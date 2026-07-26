@@ -43,6 +43,17 @@ const UNINSTALL = has('--uninstall') || has('--remove');
 const DRY = has('--dry-run');
 const PROJECT = has('--project');
 
+// --global-projects a,b — which projects' `critical` lessons follow you into
+// every session. Baked into the hook command as an env prefix so the value
+// lives in YOUR settings.json, not in this repo: the engine ships no project
+// names, only the mechanism for using them.
+const gpIdx = argv.indexOf('--global-projects');
+const GLOBAL_PROJECTS = gpIdx !== -1 ? (argv[gpIdx + 1] || '') : '';
+if (gpIdx !== -1 && (!GLOBAL_PROJECTS || GLOBAL_PROJECTS.startsWith('--'))) {
+  console.error('✗ --global-projects needs a comma-separated value, e.g. --global-projects tooling');
+  process.exit(1);
+}
+
 const settingsPath = PROJECT
   ? join(process.cwd(), '.claude', 'settings.json')
   : join(homedir(), '.claude', 'settings.json');
@@ -110,10 +121,13 @@ function main() {
     if (removed) changed += removed;
 
     if (!UNINSTALL) {
+      const envPrefix = GLOBAL_PROJECTS
+        ? `BRAIN_HOOK_GLOBAL_PROJECTS=${JSON.stringify(GLOBAL_PROJECTS)} `
+        : '';
       const group = {
         hooks: [{
           type: 'command',
-          command: `${py} ${JSON.stringify(join(HOOKS_DIR, h.file))}`,
+          command: `${envPrefix}${py} ${JSON.stringify(join(HOOKS_DIR, h.file))}`,
           timeout: h.timeout,
         }],
       };

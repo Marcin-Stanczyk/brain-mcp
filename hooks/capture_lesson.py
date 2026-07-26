@@ -49,11 +49,26 @@ INCIDENT_PROMPT = (
     "  CAUSE    — the mechanism, not the symptom\n"
     "  FIX      — what actually resolved it\n"
     "  VERIFY   — the check that proved it, and would have caught it earlier\n"
-    "\nUse severity=critical if it could destroy work again, and "
-    "project=claude-code-setup for tooling lessons (those surface in every "
-    "session regardless of directory).\n"
+    "\nUse severity=critical if it could destroy work again.{global_hint}\n"
     "\nIf every one of them was routine, say so in one sentence and finish."
 )
+
+
+GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
+    "BRAIN_HOOK_GLOBAL_PROJECTS", "").split(",") if p.strip()]
+
+
+def global_hint():
+    """Only mention the cross-cutting project when one is actually configured.
+
+    The engine must not ship a project name — which projects are cross-cutting
+    is a property of the user's knowledge base, not of this code.
+    """
+    if not GLOBAL_PROJECTS:
+        return ""
+    names = " or ".join(f"project={p}" for p in GLOBAL_PROJECTS)
+    return (f" For tooling lessons use {names} — those are injected into every "
+            f"session regardless of directory.")
 
 
 def read_incidents(session_id):
@@ -155,7 +170,8 @@ def main():
         listing = "\n".join(describe(i) for i in incidents[:6])
         if len(incidents) > 6:
             listing += f"\n  - …and {len(incidents) - 6} more"
-        reason = INCIDENT_PROMPT.format(n=len(incidents), listing=listing)
+        reason = INCIDENT_PROMPT.format(n=len(incidents), listing=listing,
+                                        global_hint=global_hint())
     else:
         reason = GENERIC_PROMPT
 

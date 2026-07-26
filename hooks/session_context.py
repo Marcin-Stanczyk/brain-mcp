@@ -32,9 +32,11 @@ MAX_LESSONS = int(os.environ.get("BRAIN_HOOK_MAX_LESSONS", "12"))
 MAX_CHARS = int(os.environ.get("BRAIN_HOOK_MAX_CHARS", "4000"))
 # Projects whose `critical` lessons are cross-cutting and injected in every
 # session regardless of cwd — tooling traps, harness rules, destructive-command
-# lessons. Comma-separated. Set to "" to disable.
-GLOBAL_PROJECTS = [p for p in os.environ.get(
-    "BRAIN_HOOK_GLOBAL_PROJECTS", "claude-code-setup").split(",") if p.strip()]
+# lessons. Comma-separated project names, empty (the default) disables it.
+# Deliberately not defaulted to a project name: which projects are cross-cutting
+# is a property of your knowledge base, not of this engine.
+GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
+    "BRAIN_HOOK_GLOBAL_PROJECTS", "").split(",") if p.strip()]
 MAX_GLOBAL_CRITICALS = int(os.environ.get("BRAIN_HOOK_MAX_GLOBAL", "4"))
 SNIPPET_CHARS = 220
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")

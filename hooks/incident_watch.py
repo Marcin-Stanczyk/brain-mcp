@@ -53,6 +53,18 @@ REVERT_PATTERNS = [
 MAX_FAILS_BEFORE_INCIDENT = 2
 MAX_CMD_CHARS = 400
 
+GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
+    "BRAIN_HOOK_GLOBAL_PROJECTS", "").split(",") if p.strip()]
+
+
+def global_hint():
+    """Named only when configured — this engine ships no project names."""
+    if not GLOBAL_PROJECTS:
+        return ""
+    names = " or ".join(f"project={p}" for p in GLOBAL_PROJECTS)
+    return (f" For tooling lessons use {names} — those are injected into every "
+            f"session regardless of directory.")
+
 
 def journal_path(session_id):
     return os.path.join(STATE_DIR, f"{session_id}-incidents.jsonl")
@@ -101,9 +113,7 @@ PROMPT = (
     "  VERIFY   — the check that proved the fix worked, and that would have "
     "caught this earlier\n"
     "\n"
-    "Set severity=critical when the same mistake could destroy work again, and "
-    "project=claude-code-setup when it is about tooling rather than one codebase "
-    "— those are injected into every session regardless of directory.\n"
+    "Set severity=critical when the same mistake could destroy work again.{global_hint}\n"
     "\n"
     "If it was routine (discarding a scratch edit, aborting an experiment), "
     "ignore this and carry on."
@@ -142,7 +152,8 @@ def main():
                 "hookSpecificOutput": {
                     "hookEventName": event or "PostToolUse",
                     "additionalContext": PROMPT.format(
-                        label=label, meaning=meaning, cmd=cmd),
+                        label=label, meaning=meaning, cmd=cmd,
+                        global_hint=global_hint()),
                 }
             }))
             return
