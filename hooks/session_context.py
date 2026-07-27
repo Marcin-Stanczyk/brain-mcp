@@ -10,6 +10,9 @@ It injects two things:
   1. Lessons stored for the current project, criticals first.
   2. A note when a graphify code graph exists, so the agent queries the graph
      instead of grepping. (Optional — skipped silently if you don't use graphify.)
+     The note is downgraded to a warning when the graph is behind HEAD: a stale
+     index is worse than none, because this hook is what tells the agent to
+     trust it over grep.
 
 Database location, in order of precedence:
   1. $BRAIN_DB
@@ -20,7 +23,9 @@ session from starting.
 """
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -46,26 +51,131 @@ def project_name(cwd: str) -> str:
     return os.path.basename(cwd.rstrip("/")) or "unknown"
 
 
+# graph.json can be tens of MB; built_at_commit is a top-level key written last,
+# so a bounded tail read finds it without parsing the whole document.
+GRAPH_TAIL_BYTES = 4096
+GRAPH_PARSE_LIMIT = 32 * 1024 * 1024  # only fall back to a full parse below this
+_COMMIT_RE = re.compile(rb'"built_at_commit"\s*:\s*"([0-9a-fA-F]{7,40})"')
+
+
+def graph_commit(graph_path: str):
+    """The commit a graph was built from, or None if it doesn't record one."""
+    try:
+        size = os.path.getsize(graph_path)
+        with open(graph_path, "rb") as f:
+            f.seek(max(0, size - GRAPH_TAIL_BYTES))
+            m = _COMMIT_RE.search(f.read())
+        if m:
+            return m.group(1).decode()
+        # Key isn't at the tail (different writer or key order) — parse, but only
+        # if that is cheap enough to do on every session start.
+        if size <= GRAPH_PARSE_LIMIT:
+            with open(graph_path, encoding="utf-8") as f:
+                return json.load(f).get("built_at_commit") or None
+    except Exception:
+        pass
+    return None
+
+
+def git(root: str, *args, timeout=2.0):
+    """Run a read-only git command, returning stripped stdout or None."""
+    try:
+        r = subprocess.run(("git", "-C", root) + args, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def outdated_sources(root: str, graph_path: str, manifest, limit=8000):
+    """Indexed files that changed on disk after the graph was written.
+
+    Timestamps, not commits, are the honest test of whether an index describes
+    the current code. Commit comparison has two failure modes that timestamps
+    do not: uncommitted edits look current, and an indexer that skips a commit
+    without restamping looks permanently stale. This also keeps the engine
+    indexer-agnostic — no language list, no coupling to which extensions some
+    indexer decided are worth rebuilding for.
+
+    Returns (changed, deleted), or (None, None) when it cannot be determined.
+    """
+    if not manifest:
+        return None, None
+    try:
+        graph_mtime = os.path.getmtime(graph_path)
+    except OSError:
+        return None, None
+    changed = deleted = 0
+    for i, rel in enumerate(manifest):
+        if i >= limit:  # pathological repo: stop rather than stall a session
+            break
+        try:
+            if os.path.getmtime(os.path.join(root, rel)) > graph_mtime:
+                changed += 1
+        except OSError:
+            deleted += 1
+    return changed, deleted
+
+
+def graph_drift(root: str, graph_path: str, manifest=None) -> dict:
+    """How far a graph has fallen behind the working tree.
+
+    Keys: changed/deleted (indexed files newer than the graph, None = unknown),
+    behind (commits, informational only), is_repo.
+
+    Freshness is decided by `changed`/`deleted`; the commit count only makes
+    the message concrete. Note the two are independent — a graph can be zero
+    commits behind and still stale from uncommitted edits.
+    """
+    out = {"is_repo": False, "behind": None, "changed": None, "deleted": None}
+    out["changed"], out["deleted"] = outdated_sources(root, graph_path, manifest)
+
+    head = git(root, "rev-parse", "HEAD")
+    if head is None:
+        return out
+    out["is_repo"] = True
+
+    built = graph_commit(graph_path)
+    if not built:
+        return out
+    if head.startswith(built) or built.startswith(head):
+        out["behind"] = 0
+        return out
+    n = git(root, "rev-list", "--count", f"{built}..HEAD")
+    try:
+        out["behind"] = int(n)
+    except (TypeError, ValueError):
+        pass  # unreachable commit: rewritten history or a different clone
+    return out
+
+
 def find_graph(cwd: str):
-    """Look for graphify-out/graph.json in cwd and up to 3 levels above."""
+    """Look for graphify-out/graph.json in cwd and up to 3 levels above.
+
+    Returns (relpath, files_indexed, drift) or (None, None, None).
+    """
     d = os.path.abspath(cwd)
     for _ in range(4):
-        g = os.path.join(d, "graphify-out", "graph.json")
+        out = os.path.join(d, "graphify-out")
+        g = os.path.join(out, "graph.json")
         if os.path.exists(g):
-            nodes = None
+            man = None
             try:
-                # read the manifest, never parse the multi-MB graph.json
-                with open(os.path.join(d, "graphify-out", "manifest.json")) as f:
-                    man = json.load(f)
-                nodes = man.get("node_count") or None
+                # manifest.json maps source path -> hashes, one entry per
+                # indexed file. It carries no node count — don't invent one.
+                with open(os.path.join(out, "manifest.json")) as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and loaded:
+                    man = loaded
             except Exception:
                 pass
-            return os.path.relpath(g, cwd), nodes
+            files = len(man) if man else None
+            return os.path.relpath(g, cwd), files, graph_drift(d, g, man)
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    return None, None
+    return None, None, None
 
 
 def connect_ro():
@@ -116,6 +226,59 @@ def fetch_lessons(project: str):
         return []
     finally:
         con.close()
+
+
+QUERY_HINT = ('`graphify explain "X"`, `graphify path "A" "B"`')
+
+
+def graph_note(graph: str, files, drift: dict) -> str:
+    """Phrase the graph note according to how much the graph can be trusted.
+
+    This hook is the only thing telling the agent to prefer the graph over
+    grep, so it is also the only thing that can withdraw that advice. Grep is
+    always current; the graph is only as current as its last build.
+    """
+    behind = (drift or {}).get("behind")
+    changed = (drift or {}).get("changed")
+    deleted = (drift or {}).get("deleted") or 0
+    size = f", {files} files indexed" if files else ""
+
+    if changed is None:
+        # No manifest, or it could not be read — nothing to compare against.
+        return (
+            f"\n## graphify code graph available, freshness UNVERIFIED ({graph}{size})\n"
+            "A graph exists but its freshness cannot be checked (no readable "
+            f"manifest). Use it to orient ({QUERY_HINT}), then confirm with grep "
+            "before relying on it."
+        )
+
+    if not changed and not deleted:
+        extra = (f" ({behind} commit(s) behind HEAD, none affecting indexed files)"
+                 if behind else "")
+        return (
+            f"\n## graphify code graph available ({graph}{size}, verified current"
+            f"{extra})\n"
+            "Every indexed file is older than the graph. For questions about "
+            "architecture, dependencies, or where code lives, query the graph "
+            f"({QUERY_HINT}) BEFORE grepping or bulk-reading files — it is the "
+            "cheaper way to navigate."
+        )
+
+    bits = []
+    if changed:
+        bits.append(f"{changed} indexed file(s) modified since it was built")
+    if deleted:
+        bits.append(f"{deleted} indexed file(s) no longer exist")
+    if behind:
+        bits.append(f"{behind} commit(s) behind HEAD")
+    return (
+        f"\n## graphify code graph is STALE ({graph}{size} — {'; '.join(bits)})\n"
+        f"Use it only as a map of where things roughly are ({QUERY_HINT}). Do NOT "
+        "treat an absent node as proof that code does not exist, and confirm "
+        "anything load-bearing with grep or by reading the file — grep reflects "
+        "what is on disk now, the graph reflects an earlier state.\n"
+        "Refresh with `graphify update <repo>` when the answer depends on it."
+    )
 
 
 def write_marker(session_id: str):
@@ -172,16 +335,9 @@ def main():
             "to record anything non-obvious you discover this session."
         )
 
-    graph, nodes = find_graph(cwd)
+    graph, files, drift = find_graph(cwd)
     if graph:
-        size = f", {nodes} nodes" if nodes else ""
-        parts.append(f"\n## graphify code graph available ({graph}{size})")
-        parts.append(
-            "This project has a prebuilt knowledge graph. For questions about "
-            "architecture, dependencies, or where code lives, query the graph "
-            "(`graphify explain \"X\"`, `graphify path \"A\" \"B\"`) BEFORE grepping "
-            "or bulk-reading files — it is the cheaper way to navigate."
-        )
+        parts.append(graph_note(graph, files, drift))
 
     if not parts:
         return
