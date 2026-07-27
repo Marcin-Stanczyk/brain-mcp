@@ -45,13 +45,38 @@ REVERT_PATTERNS = [
     ("git-clean", r"\bgit\s+clean\s+-[a-z]*f", "deleted untracked files"),
     ("git-stash-drop", r"\bgit\s+stash\s+(drop|clear)\b", "discarded stashed work"),
     ("git-amend", r"\bgit\s+commit\b.*--amend", "rewrote a commit that was wrong"),
-    ("restore-backup", r"\b(cp|mv|rsync)\b[^\n]*\.(bak|backup|orig)\b",
+    # Only a backup used as SOURCE is an undo. The naive version matched the
+    # destination too, so `cp config.json config.json.bak` — creating a backup,
+    # the most cautious thing anyone does — was reported as a revert. It fired
+    # twice in one session on deliberate pre-change backups; two false alarms is
+    # how a hook earns being switched off.
+    ("restore-backup",
+     r"\b(cp|mv|rsync)\b[^\n]*\S\.(bak|backup|orig)\b(?![\w./-]*\s*$)",
      "restored from a backup"),
     ("rebase-abort", r"\bgit\s+rebase\s+--abort\b", "abandoned a rebase"),
 ]
 
 MAX_FAILS_BEFORE_INCIDENT = 2
 MAX_CMD_CHARS = 400
+
+# `python3 - <<'PY' ... PY` and friends carry a whole script as data. Text
+# inside is not a command this shell runs, but it is still text this hook would
+# scan — and a script that merely mentions `git checkout` (a test fixture, a
+# docstring, a generated file) then reads as a revert. Observed three times in
+# one session, including on this file's own tests.
+_HEREDOC = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?")
+
+
+def strip_heredocs(cmd: str) -> str:
+    """Return only the parts of a command the shell itself executes."""
+    m = _HEREDOC.search(cmd)
+    if not m:
+        return cmd
+    head = cmd[:m.end()]
+    # Whatever follows the terminator is real shell again (e.g. `| tail -5`).
+    end = re.search(rf"^{re.escape(m.group(1))}\s*$", cmd[m.end():], re.M)
+    tail = cmd[m.end() + end.end():] if end else ""
+    return head + tail
 
 GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
     "BRAIN_HOOK_GLOBAL_PROJECTS", "").split(",") if p.strip()]
@@ -144,8 +169,9 @@ def main():
         return
 
     # --- signal 1: an undo ran (prompt immediately) ---
+    scan = strip_heredocs(cmd)
     for label, pattern, meaning in REVERT_PATTERNS:
-        if re.search(pattern, cmd):
+        if re.search(pattern, scan):
             append(sid, {"kind": "revert", "label": label, "cmd": cmd,
                          "meaning": meaning})
             print(json.dumps({
