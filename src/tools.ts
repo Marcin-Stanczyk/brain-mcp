@@ -11,7 +11,8 @@ import {
 } from "fs";
 import { join, dirname, sep, basename, isAbsolute, resolve } from "path";
 import { createHash } from "crypto";
-import { rrfFuse, type Embedder, type EmbeddingsConfig } from "./embeddings.js";
+import { rrfFuse, type Embedder, type EmbeddingsConfig, type RankedList } from "./embeddings.js";
+import { planFtsQuery } from "./query.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
@@ -273,26 +274,38 @@ export function scanProjects(db: Database.Database, codeDir: string): ProjectInf
   return results;
 }
 
-// ── FTS5 query sanitizer ────────────────────────────────────────────────────
+// ── FTS5 query building ─────────────────────────────────────────────────────
 
-// Sanitize FTS5 query: quote tokens with special chars (hyphens, dots) that FTS5 misinterprets as operators
-export function sanitizeFTS5Query(query: string): string {
-  return query
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(token => {
-      // If token contains special chars that FTS5 treats as operators, quote it
-      if (/[-.]/.test(token) && !token.startsWith('"')) {
-        return `"${token.replace(/"/g, '')}"`;
-      }
-      // Remove any standalone FTS5 operators that could cause errors
-      if (/^(AND|OR|NOT|NEAR)$/i.test(token)) {
-        return `"${token}"`;
-      }
-      return token;
-    })
-    .join(' ');
-}
+// Lives in ./query.ts, which is pure string work and has no database in it —
+// see that file for why an implicit-AND query over a sentence returned nothing.
+// Re-exported here because that is where callers and tests have always found it.
+export { sanitizeFTS5Query, planFtsQuery, tokenizeQuery } from "./query.js";
+
+// ── Ranking policy ──────────────────────────────────────────────────────────
+
+/**
+ * How much each retriever's ranking counts in the fusion.
+ *
+ * Ordered by precision, and the gaps matter more than the absolute numbers.
+ * `all` outweighs the rest combined at equal rank, so a lesson containing every
+ * word of the question stays on top; `prefix` is deliberately weak because it is
+ * there to rescue an inflected word, not to have opinions about relevance.
+ */
+export const RETRIEVER_WEIGHTS = {
+  all: 3,
+  any: 1.5,
+  vector: 1.5,
+  prefix: 0.6,
+} as const;
+
+/** Multiplied into a fused score. A tie-breaker — see the note at the call site. */
+export const SEVERITY_BOOST: Record<string, number> = {
+  critical: 1.25,
+  important: 1.1,
+};
+
+/** Lessons filed as being about a tool rather than a project travel further. */
+export const SCOPE_GLOBAL_BOOST = 1.05;
 
 // ── Export/import helpers ───────────────────────────────────────────────────
 
@@ -476,55 +489,90 @@ export function createTools(
       limit?: number;
     }): Promise<TextResult> => {
       let results;
-      // id → which retriever(s) found it (hybrid mode only)
+      // id → which retriever(s) found it
       let matchedBy: Map<number, string[]> | null = null;
       let modeNote = "";
+      let searchedTerms: string[] = [];
 
       if (query.trim()) {
         const max = limit || 10;
-        // Over-fetch both retrievers so reciprocal rank fusion has depth to work with.
+        // Over-fetch every retriever so reciprocal rank fusion has depth to work with.
         const fetchN = Math.min(100, max * 5);
 
-        const safeQuery = sanitizeFTS5Query(query);
-        let sql = `
-          SELECT l.id, l.content, l.category, l.tags, l.project, l.source, l.severity, l.created_at,
-                 rank
-          FROM lessons_fts fts
-          JOIN lessons l ON l.id = fts.rowid
-          WHERE lessons_fts MATCH ?
-        `;
-        const params: (string | number)[] = [safeQuery];
+        // The plan is three queries over one set of terms: every term (precise),
+        // any term (recall), any stem (morphology). Running only the first is
+        // what made an ordinary sentence return nothing — see src/query.ts.
+        const plan = planFtsQuery(query);
+        searchedTerms = plan.terms;
 
-        if (category) {
-          sql += ` AND l.category = ?`;
-          params.push(category);
-        }
-        if (project) {
-          sql += ` AND (l.project = ? OR l.tags LIKE ?)`;
-          params.push(project);
-          params.push(`%"${project}"%`);
-        }
+        const rowById = new Map<number, Record<string, unknown>>();
+        const lists: RankedList[] = [];
 
-        sql += ` ORDER BY rank LIMIT ?`;
-        params.push(fetchN);
+        /**
+         * Run one MATCH and remember the rows it found, best-first.
+         *
+         * A malformed query must not surface as a SQLite error message: the
+         * caller asked a question, not for a parser diagnostic, and the other
+         * retrievers may still answer it. Every term is quoted upstream, so this
+         * should be unreachable — it is here because "should be" is how the old
+         * code came to throw `fts5: syntax error near "fix"` at anyone who typed
+         * a question mark.
+         */
+        const addRetriever = (retriever: string, weight: number, match: string | null): void => {
+          if (!match) return;
+          let sql = `
+            SELECT l.id, l.content, l.category, l.tags, l.project, l.source,
+                   l.severity, l.scope, l.created_at
+            FROM lessons_fts fts
+            JOIN lessons l ON l.id = fts.rowid
+            WHERE lessons_fts MATCH ?
+          `;
+          const params: (string | number)[] = [match];
 
-        const ftsRows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+          if (category) {
+            sql += ` AND l.category = ?`;
+            params.push(category);
+          }
+          if (project) {
+            sql += ` AND (l.project = ? OR l.tags LIKE ?)`;
+            params.push(project);
+            params.push(`%"${project}"%`);
+          }
 
-        results = ftsRows.slice(0, max);
+          sql += ` ORDER BY bm25(lessons_fts) LIMIT ?`;
+          params.push(fetchN);
+
+          let rows: Record<string, unknown>[];
+          try {
+            rows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+          } catch (err) {
+            console.error(
+              `⚠️ brain-mcp: retriever '${retriever}' failed (${err instanceof Error ? err.message : String(err)}) — skipped.`
+            );
+            return;
+          }
+
+          for (const row of rows) {
+            const id = Number(row.id);
+            if (!rowById.has(id)) rowById.set(id, row);
+          }
+          lists.push({ retriever, weight, ids: rows.map((r) => Number(r.id)) });
+        };
+
+        addRetriever("all", RETRIEVER_WEIGHTS.all, plan.all);
+        addRetriever("any", RETRIEVER_WEIGHTS.any, plan.any);
+        addRetriever("prefix", RETRIEVER_WEIGHTS.prefix, plan.prefix);
 
         if (hybridEnabled) {
-          // Hybrid mode: FTS5 + KNN, merged with reciprocal rank fusion.
-          // Any embedding failure (Ollama down, model missing, dim mismatch)
-          // silently falls back to the FTS5 results computed above.
+          // Vector search joins as one more opinion. Any embedding failure
+          // (Ollama down, model missing, dimension mismatch) simply leaves the
+          // lexical retrievers to answer alone.
           try {
             const queryVec = await embedder!(query);
             const knnHits = vector!.knn(queryVec, fetchN * 2);
 
-            const rowById = new Map<number, Record<string, unknown>>();
-            for (const row of ftsRows) rowById.set(Number(row.id), row);
-
             const getRow = db.prepare(
-              "SELECT id, content, category, tags, project, source, severity, created_at FROM lessons WHERE id = ?"
+              "SELECT id, content, category, tags, project, source, severity, scope, created_at FROM lessons WHERE id = ?"
             );
             const vecIds: number[] = [];
             for (const hit of knnHits) {
@@ -534,7 +582,7 @@ export function createTools(
                 if (!row) continue; // stale vector for a deleted lesson
                 rowById.set(hit.id, row);
               }
-              // Apply the same filters the FTS query used.
+              // Apply the same filters the lexical retrievers used.
               if (category && row.category !== category) continue;
               if (
                 project &&
@@ -545,20 +593,39 @@ export function createTools(
               if (vecIds.length >= fetchN) break;
             }
 
-            const fused = rrfFuse([
-              { retriever: "fts", ids: ftsRows.map((r) => Number(r.id)) },
-              { retriever: "vector", ids: vecIds },
-            ]).slice(0, max);
-
-            results = fused.map((h) => rowById.get(h.id)).filter(Boolean) as Record<string, unknown>[];
-            matchedBy = new Map(fused.map((h) => [h.id, h.retrievers]));
-            modeNote = " (hybrid: FTS5 + vector, RRF-fused)";
+            lists.push({ retriever: "vector", weight: RETRIEVER_WEIGHTS.vector, ids: vecIds });
+            modeNote = " (hybrid: lexical + vector, RRF-fused)";
           } catch (err) {
             console.error(
-              `⚠️ brain-mcp: hybrid recall degraded to FTS5-only (${err instanceof Error ? err.message : String(err)})`
+              `⚠️ brain-mcp: hybrid recall degraded to lexical-only (${err instanceof Error ? err.message : String(err)})`
             );
           }
         }
+
+        // SEVERITY AND SCOPE ARE TIE-BREAKERS, NOT RANKINGS.
+        // They nudge a fused score by a few percent, which decides between two
+        // lessons the retrievers found equally relevant and can never promote an
+        // unrelated one. The same asymmetry the prompt hook uses, and for the
+        // same reason: a `critical` lesson nobody reads is a lesson that failed.
+        const boosted = rrfFuse(lists).map((hit) => {
+          const row = rowById.get(hit.id);
+          const severity = String(row?.severity ?? "");
+          const scope = String(row?.scope ?? "project");
+          let score = hit.score;
+          score *= SEVERITY_BOOST[severity] ?? 1;
+          if (scope === "global") score *= SCOPE_GLOBAL_BOOST;
+          return { ...hit, score };
+        });
+        boosted.sort(
+          (a, b) =>
+            b.score - a.score ||
+            b.retrievers.length - a.retrievers.length ||
+            a.id - b.id
+        );
+
+        const top = boosted.slice(0, max);
+        results = top.map((h) => rowById.get(h.id)).filter(Boolean) as Record<string, unknown>[];
+        matchedBy = new Map(top.map((h) => [h.id, h.retrievers]));
       } else {
         let sql = `SELECT * FROM lessons WHERE 1=1`;
         const params: (string | number)[] = [];
@@ -580,9 +647,46 @@ export function createTools(
       }
 
       if (!results.length) {
+        // A BARE "NOT FOUND" IS WHAT TAUGHT CALLERS THE BASE WAS EMPTY.
+        // The old message said nothing about what had actually been searched
+        // for, so a query that quietly reduced to two terms and a query that hit
+        // a genuinely empty base were indistinguishable. Say which terms were
+        // used and how much was searched, so the next attempt can be aimed.
+        const total = (db.prepare("SELECT COUNT(*) AS c FROM lessons").get() as { c: number }).c;
+        const filters = [
+          category ? `category=${category}` : null,
+          project ? `project=${project}` : null,
+        ].filter(Boolean).join(", ");
+        const detail = searchedTerms.length
+          ? `Searched ${total} lessons for: ${searchedTerms.join(", ")}.`
+          : query.trim()
+            ? `Searched ${total} lessons — the query reduced to no usable terms (too short, or all stopwords).`
+            : `The base holds ${total} lessons; no query was given, so only the filters applied.`;
         return {
-          content: [{ type: "text" as const, text: "No matching lessons found." }],
+          content: [{
+            type: "text" as const,
+            text: `No matching lessons found. ${detail}${filters ? ` Filters: ${filters}.` : ""}`,
+          }],
         };
+      }
+
+      // Count the retrieval. Until brain_recall did this, only the hooks marked
+      // lessons as seen, so `brain_status` reported the tool's hits as dead
+      // weight — a metric that punished the lessons for the tool's silence.
+      // Deliberately not touching updated_at: see the schema note in initDB.
+      try {
+        const mark = db.prepare(
+          "UPDATE lessons SET shown_count = shown_count + 1, last_shown_at = datetime('now') WHERE id = ?"
+        );
+        const markAll = db.transaction((ids: number[]) => {
+          for (const id of ids) mark.run(id);
+        });
+        markAll((results as Record<string, unknown>[]).map((r) => Number(r.id)));
+      } catch (err) {
+        // A locked database must not turn a successful search into an error.
+        console.error(
+          `⚠️ brain-mcp: could not record retrieval (${err instanceof Error ? err.message : String(err)})`
+        );
       }
 
       const formatted = (results as Record<string, unknown>[]).map((r) => {
@@ -592,8 +696,12 @@ export function createTools(
         return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${r.content}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}`;
       }).join("\n\n---\n\n");
 
+      const termNote = searchedTerms.length ? ` for: ${searchedTerms.join(", ")}` : "";
       return {
-        content: [{ type: "text" as const, text: `Found ${results.length} lessons${modeNote}:\n\n${formatted}` }],
+        content: [{
+          type: "text" as const,
+          text: `Found ${results.length} lessons${modeNote}${termNote}:\n\n${formatted}`,
+        }],
       };
     },
   });
@@ -780,7 +888,13 @@ export function createTools(
       // Embeddings / vector search status
       output += `### Embeddings\n`;
       if (!embeddingsConfig) {
-        output += `Mode: disabled (set BRAIN_EMBEDDINGS_URL to enable hybrid search — see README)\n\n`;
+        // SAY WHAT IS RUNNING, NOT ONLY WHAT IS OFF.
+        // "Mode: disabled" on its own reads as a broken installation, and has
+        // been read that way — an agent reported the base as keyword-only and
+        // concluded recall could not be trusted. Lexical search is the default,
+        // not a degraded state; vectors add paraphrase matching on top of it.
+        output += `Mode: lexical only — all/any/prefix retrievers, RRF-fused (semantic search off; ` +
+          `set BRAIN_EMBEDDINGS_URL to add it — see README)\n\n`;
       } else if (!vector) {
         output += `Mode: enabled (${embeddingsConfig.model}) but vector index unavailable — sqlite-vec failed to load, running FTS5-only\n\n`;
       } else {

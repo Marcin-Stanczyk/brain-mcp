@@ -53,6 +53,10 @@ BOOST_SAME_PROJECT = 2.0
 BOOST_GLOBAL_SCOPE = 1.0
 BOOST_SEVERITY = {"critical": 1.5, "important": 0.75, "high": 0.75}
 
+# Added (bm25 is lower-is-better) to anything only the stem query found, so a
+# morphological match can fill a slot but never take one from an exact match.
+PREFIX_PENALTY = 2.0
+
 # Below this, a "match" is a coincidence of one common word. Tuned to keep the
 # hook silent rather than chatty: an irrelevant hit costs more than a miss,
 # because it is what teaches the reader to stop reading.
@@ -127,8 +131,10 @@ def record_shown(session_id, ids):
 
 def search(prompt, project, exclude):
     """Rank lessons by relevance to the prompt, across every project."""
+    if len(bd.fts_terms(prompt)) < MIN_TERMS:
+        return []
     query = bd.fts_query(prompt)
-    if not query or query.count(" OR ") + 1 < MIN_TERMS:
+    if not query:
         return []
 
     con = bd.connect(readonly=True)
@@ -137,8 +143,7 @@ def search(prompt, project, exclude):
     try:
         has_scope = "scope" in bd.columns(con)
         scope_col = "COALESCE(l.scope, 'project')" if has_scope else "'project'"
-        rows = con.execute(
-            f"""
+        sql = f"""
             SELECT l.id, l.category, l.content, l.severity, l.project,
                    {scope_col} AS scope, bm25(lessons_fts) AS rank
             FROM lessons_fts
@@ -146,9 +151,20 @@ def search(prompt, project, exclude):
             WHERE lessons_fts MATCH ?
             ORDER BY rank
             LIMIT 60
-            """,
-            (query,),
-        ).fetchall()
+            """
+        rows = con.execute(sql, (query,)).fetchall()
+
+        # A SECOND PASS OVER STEMS, NOT A REPLACEMENT FOR THE FIRST.
+        # `zamówieniach` in the prompt and `zamówienia` in the lesson are one
+        # word to a reader and two to FTS5. The stem query finds those, and
+        # PREFIX_PENALTY keeps them below anything the exact query matched —
+        # a shared stem is weaker evidence than a shared word, not equal to it.
+        prefix = bd.fts_prefix_query(prompt)
+        if prefix:
+            seen_ids = {r[0] for r in rows}
+            for row in con.execute(sql, (prefix,)).fetchall():
+                if row[0] not in seen_ids:
+                    rows.append(row[:6] + (float(row[6]) + PREFIX_PENALTY,))
     except Exception:
         return []
     finally:

@@ -158,6 +158,26 @@ class TestBrainDB(unittest.TestCase):
         q = self.bd.fts_query("bash bash bash script")
         self.assertEqual(1, q.count('"bash"'))
 
+    def test_fts_terms_is_unicode_aware(self):
+        # Polish words must survive tokenizing intact. Splitting them would
+        # search the base for fragments nobody ever wrote.
+        self.assertEqual(
+            ["zamówień", "łódź", "ćwiczenia"],
+            self.bd.fts_terms("zamówień łódź ćwiczenia"),
+        )
+
+    def test_prefix_query_stems_long_terms_only(self):
+        # `zamówieniach` in a prompt and `zamówienia` in a lesson are one word to
+        # a reader and two to FTS5. Trimming the inflected tail bridges them.
+        q = self.bd.fts_prefix_query("zamówieniach koszty")
+        self.assertIn('"zamówienia"*', q)
+        self.assertIn('"koszty"*', q, "a six-letter term is left whole")
+
+    def test_prefix_query_empty_when_nothing_was_stemmed(self):
+        # Identical to the exact query, so running it would only add noise.
+        self.assertEqual("", self.bd.fts_prefix_query("wp eval"))
+        self.assertEqual("", self.bd.fts_prefix_query(""))
+
     def test_migrate_is_idempotent_and_adds_every_column(self):
         tmp = tempfile.mkdtemp()
         try:

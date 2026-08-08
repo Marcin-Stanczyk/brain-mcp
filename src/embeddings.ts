@@ -87,11 +87,21 @@ export const RRF_K = 60;
 export interface RankedList {
   retriever: string;
   ids: number[];
+  /**
+   * How much this retriever's opinion counts, relative to the others. Default 1.
+   *
+   * Unweighted RRF gives every list's top hit the same score, which is wrong the
+   * moment the lists differ in precision: a lesson that merely shares a word
+   * stem with the question would tie with one that contains every word of it.
+   * The weight is what keeps a forgiving retriever useful for filling the tail
+   * without letting it take the top.
+   */
+  weight?: number;
 }
 
 export interface FusedHit {
   id: number;
-  /** Sum over lists of 1 / (k + rank), rank starting at 1. */
+  /** Sum over lists of weight / (k + rank), rank starting at 1. */
   score: number;
   /** Which retrievers returned this id (insertion order of `lists`). */
   retrievers: string[];
@@ -99,13 +109,16 @@ export interface FusedHit {
 
 /**
  * Merge several ranked id lists with Reciprocal Rank Fusion:
- *   score(id) = Σ_lists 1 / (k + rank_in_list)
+ *   score(id) = Σ_lists weight_list / (k + rank_in_list)
  * Ids missing from a list contribute nothing for that list. Pure function.
  * Ties break deterministically: more retrievers first, then lower id.
  */
 export function rrfFuse(lists: RankedList[], k: number = RRF_K): FusedHit[] {
   const hits = new Map<number, FusedHit>();
   for (const list of lists) {
+    const weight = typeof list.weight === "number" && Number.isFinite(list.weight)
+      ? list.weight
+      : 1;
     const seen = new Set<number>();
     for (let rank = 0; rank < list.ids.length; rank++) {
       const id = list.ids[rank];
@@ -116,7 +129,7 @@ export function rrfFuse(lists: RankedList[], k: number = RRF_K): FusedHit[] {
         hit = { id, score: 0, retrievers: [] };
         hits.set(id, hit);
       }
-      hit.score += 1 / (k + rank + 1);
+      hit.score += weight / (k + rank + 1);
       if (!hit.retrievers.includes(list.retriever)) {
         hit.retrievers.push(list.retriever);
       }

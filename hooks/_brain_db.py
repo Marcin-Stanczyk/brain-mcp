@@ -98,19 +98,48 @@ STOPWORDS = {
 }
 
 
-def fts_query(text, max_terms=24):
-    """A sanitised OR-query, or "" when there is nothing worth searching for."""
+def fts_terms(text, max_terms=24):
+    """The search terms in `text`: lowercased, de-duplicated, stopwords dropped.
+
+    Mirrors `tokenizeQuery` in src/query.ts. The two are asserted to agree by the
+    test suite, because a hook and a tool that disagree about what a word is will
+    disagree about what the knowledge base contains.
+    """
     if not text:
-        return ""
+        return []
     words = [w.lower() for w in _WORD.split(str(text)) if len(w) >= 3]
     seen, terms = set(), []
     for w in words:
         if w in STOPWORDS or w in seen:
             continue
         seen.add(w)
-        # Quoted, so a token that happens to be an FTS5 keyword (NEAR, AND, OR)
-        # is treated as text rather than as syntax.
-        terms.append(f'"{w}"')
+        terms.append(w)
         if len(terms) >= max_terms:
             break
-    return " OR ".join(terms)
+    return terms
+
+
+def fts_query(text, max_terms=24):
+    """A sanitised OR-query, or "" when there is nothing worth searching for."""
+    # Quoted, so a token that happens to be an FTS5 keyword (NEAR, AND, OR) is
+    # treated as text rather than as syntax.
+    return " OR ".join(f'"{w}"' for w in fts_terms(text, max_terms))
+
+
+def fts_prefix_query(text, max_terms=24):
+    """An OR-query over stems, or "" when no term is long enough to stem.
+
+    Polish inflects the end of a word: a lesson written about `zamówienia` is
+    invisible to a prompt that says `zamówieniach`, and both are the same thing.
+    Trimming two characters off anything long enough to survive it covers that
+    without a stemmer and without guessing the language. Mirrors `stemForPrefix`
+    in src/query.ts.
+
+    Returns "" when nothing was trimmed — an identical query run twice is just
+    noise in the ranking.
+    """
+    terms = fts_terms(text, max_terms)
+    stems = [w[:-2] if len(w) >= 7 else w for w in terms]
+    if stems == terms:
+        return ""
+    return " OR ".join(f'"{s}"*' for s in stems)

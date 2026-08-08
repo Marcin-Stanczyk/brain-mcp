@@ -196,7 +196,12 @@ test("FTS search survives hyphens, dots and bare operators (sanitizer)", async (
   const opQuery = await recall.handler({ query: "AND", limit: 5 });
   assert.ok(typeof textOf(opQuery) === "string");
 
-  assert.equal(sanitizeFTS5Query("wp-config.php AND salts"), '"wp-config.php" "AND" salts');
+  // Every token is quoted, not only those containing `-` or `.`. The old
+  // sanitizer left `(`, `:`, `?` and `^` bare, and FTS5 read them as syntax:
+  // "how do I fix (kamar) orders?" raised `fts5: syntax error near "fix"`
+  // straight out of the tool.
+  assert.equal(sanitizeFTS5Query("wp-config.php AND salts"), '"wp" "config" "php" "AND" "salts"');
+  assert.equal(sanitizeFTS5Query("how do I fix (kamar) orders?"), '"how" "do" "I" "fix" "kamar" "orders"');
 });
 
 // ── brain_forget confirm guard ──────────────────────────────────────────────

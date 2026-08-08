@@ -46,10 +46,13 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 |------|------|
 | `src/index.ts` | Server entry point — wires tools + resources to the MCP stdio transport |
 | `src/tools.ts` | Core logic — DB setup, project scanner, the 11 MCP tools |
-| `src/embeddings.ts` | Optional embeddings client (Ollama) + reciprocal rank fusion |
+| `src/query.ts` | Turns a question into FTS5 queries — tokenizing, stopwords, stemming |
+| `src/embeddings.ts` | Optional embeddings client (Ollama) + weighted reciprocal rank fusion |
 | `src/vector.ts` | sqlite-vec vector index (loads the extension, degrades gracefully) |
 | `src/resources.ts` | MCP resources: `brain://lessons/{id}`, `brain://projects/{name}` |
 | `hooks/session_context.py` | `SessionStart` hook — injects this project's lessons (reads SQLite read-only) |
+| `hooks/relevant_lessons.py` | `UserPromptSubmit` hook — searches on the prompt, when the task is finally known |
+| `hooks/_brain_db.py` | Shared DB access + the tokenizer the hooks and `src/query.ts` agree on |
 | `hooks/capture_lesson.py` | `Stop` hook — asks once for a lesson, naming the incidents that were recorded |
 | `hooks/incident_watch.py` | `PostToolUse` hook — catches undo commands and repeat failures as they happen |
 | `scripts/install-hooks.mjs` | Registers/removes the hooks in Claude Code settings (merging, idempotent) |
@@ -321,13 +324,40 @@ brain_learn({
 
 ### 2. `brain_recall` — search the knowledge base
 
-Full-text search across the whole database, with optional category and project filters.
+Search across the whole database, with optional category and project filters.
 
 **When the agent should use it:** before starting work on a task — check for known issues and gotchas.
 
 ```js
 brain_recall({ query: "cloudflare deployment", project: "my-webapp" })
 ```
+
+**Ask it in a sentence.** The query is treated as a bag of terms, not as a phrase
+that must appear verbatim, and three retrievers run over those terms and are
+merged by weighted reciprocal rank fusion:
+
+| Retriever | Matches | Weight | What it is for |
+|-----------|---------|--------|----------------|
+| `all` | every term | 3 | precision — a lesson about exactly this |
+| `any` | any term | 1.5 | recall — the question spans several lessons |
+| `prefix` | any stem | 0.6 | morphology — `zamówieniach` finds `zamówienia`, `backfilling` finds `backfill` |
+| `vector` | semantic neighbours | 1.5 | only when [embeddings](#hybrid-vector-search-optional) are enabled |
+
+Results are annotated with the retrievers that found them (`matched: all+any`),
+and the response names the terms actually searched for — including on a miss, so
+a query that quietly reduced to two words is distinguishable from an empty base.
+
+> **This is the fix for the bug that made brain-mcp look empty.** FTS5 joins bare
+> terms with an implicit AND, so `brain_recall` used to demand a single lesson
+> containing *every* word of the question. Asked
+> `"wp eval koszty zamówień backfill lipiec"` against a base of 301 lessons it
+> returned nothing — the same terms OR-ed returned 100. Punctuation was worse
+> than useless: `"how do I fix (kamar) orders?"` raised `fts5: syntax error` out
+> of the tool. Both are covered by `tests/recall.test.ts`.
+
+Severity and scope act as tie-breakers only: a `critical` lesson and a `global`
+one get a few percent, enough to order two equally relevant hits and never enough
+to promote an irrelevant one.
 
 ### 3. `brain_scan_projects` — index your code directory
 
@@ -515,6 +545,41 @@ For automated backups to a USB drive on macOS, see `scripts/backup-to-usb.sh` an
 ```bash
 npm run build
 # Your MCP client restarts the server automatically (or restart it manually)
+```
+
+### Pin the Node binary in your MCP config
+
+`better-sqlite3` is a **native** module: it is compiled against one Node ABI and
+refuses to load under another.
+
+```
+Error: The module 'better_sqlite3.node' was compiled against a different
+Node.js version using NODE_MODULE_VERSION 147. This version of Node.js
+requires NODE_MODULE_VERSION 137.
+```
+
+So `"command": "node"` in an MCP config is a coin flip: it resolves through
+`PATH`, and with a version manager (`fnm`, `nvm`, `asdf`) that depends on which
+shell happened to launch your client. The server then dies at startup — and it
+dies *before* the MCP handshake, so the client reports a connection problem
+rather than an ABI problem.
+
+Give it an absolute path to the same Node you build with:
+
+```json
+{
+  "mcpServers": {
+    "brain": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/brain-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+```bash
+node -p "process.execPath"   # the path to pin
+npm rebuild better-sqlite3   # after any Node upgrade
 ```
 
 ### Reset the database (start fresh)

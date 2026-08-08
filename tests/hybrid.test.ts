@@ -195,8 +195,9 @@ test("brain_recall runs hybrid search and annotates retrievers", async () => {
     limit: 5,
   });
   const text = textOf(found);
-  assert.match(text, /\(hybrid: FTS5 \+ vector, RRF-fused\)/, "hybrid mode note present");
-  assert.match(text, /matched: fts\+vector/, "top hit found by both retrievers");
+  assert.match(text, /\(hybrid: lexical \+ vector, RRF-fused\)/, "hybrid mode note present");
+  assert.match(text, /matched: .*vector/, "top hit found by the vector retriever too");
+  assert.match(text, /matched: all\+/, "and by the all-terms lexical retriever");
   assert.ok(text.includes("vec0 virtual table"), "the relevant lesson is returned");
 });
 
@@ -238,7 +239,11 @@ test("brain_recall silently falls back to FTS5 when embeddings are unreachable",
     const text = textOf(found);
     assert.match(text, /Found \d+ lessons/, "recall never fails because embeddings are down");
     assert.ok(!text.includes("hybrid"), "no hybrid note in fallback mode");
-    assert.ok(!text.includes("matched:"), "no retriever annotations in fallback mode");
+    // The lexical retrievers still name themselves. They are what answered, and
+    // which one answered is the difference between "the base knows this well"
+    // and "this matched on a stem" — worth saying even with vectors down.
+    assert.ok(!/matched:[^\n]*vector/.test(text), "no vector annotation in fallback mode");
+    assert.match(text, /matched: (all|any|prefix)/, "lexical retrievers still annotated");
     assert.ok(text.includes("Cloudflare Workers CPU limit"));
   } finally {
     serverDown = false;
@@ -348,5 +353,9 @@ test("brain_status reports embeddings mode and embedded/unembedded counts", asyn
   }
 
   const disabled = createTools(db, codeDir).find((t) => t.name === "brain_status")!;
-  assert.match(textOf(await disabled.handler({})), /Mode: disabled/);
+  // Names the retrievers that ARE running. A bare "disabled" was read as a
+  // broken install by an agent that then stopped trusting recall entirely.
+  const status = textOf(await disabled.handler({}));
+  assert.match(status, /Mode: lexical only/);
+  assert.match(status, /BRAIN_EMBEDDINGS_URL/, "and still says how to add semantic search");
 });
