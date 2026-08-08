@@ -527,8 +527,8 @@ rm data/knowledge.db
 ### Tests
 
 ```bash
-npm test           # the MCP server (39 tests)
-npm run test:hooks # the hooks (41 tests, standard library only)
+npm test           # the MCP server (49 tests)
+npm run test:hooks # the hooks (45 tests, standard library only)
 npm run test:all   # both
 ```
 
@@ -545,6 +545,14 @@ touch `updated_at`), the `Stop` hook's four anti-loop guards, and — for every
 hook — malformed JSON, an empty payload, a missing database, a corrupt database,
 a read-only database and an unwritable state directory. **No hook may ever be
 the reason a session fails.**
+
+`tests/hardening.test.ts` covers the questions the happy path never asks: two
+connections writing at once (a knowledge base shared by agents in separate
+worktrees is the normal case, not an edge case), a lesson archived and the search
+index not told, a round-trip of Polish prose with a fenced code block inside it —
+run twice, because a round-trip that normalises something on the first pass looks
+lossless from the second onwards — a truncated export file, and an embeddings
+endpoint that is slow rather than dead.
 
 ### Smoke test
 
