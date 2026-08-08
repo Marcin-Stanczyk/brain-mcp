@@ -396,14 +396,20 @@ export function createTools(
       project: z.string().max(200).optional().describe("Which project this relates to"),
       source: z.string().max(500).optional().describe("Where this was learned (file, URL, conversation)"),
       severity: z.enum(["critical", "important", "info", "tip"]).optional().default("info"),
+      scope: z.enum(["project", "global"]).optional().default("project").describe(
+        "'global' for a lesson about a TOOL rather than a project — a shell trap, a git " +
+        "behaviour, an API limit. Those recur everywhere, and filing them under whichever " +
+        "project happened to be open is what made them invisible where the mistake repeats."
+      ),
     },
-    handler: async ({ content, category, tags, project, source, severity }: {
+    handler: async ({ content, category, tags, project, source, severity, scope }: {
       content: string;
       category: string;
       tags?: string[];
       project?: string;
       source?: string;
       severity?: string;
+      scope?: string;
     }): Promise<TextResult> => {
       // Auto-detect project from tags if not explicitly provided
       let resolvedProject = project || null;
@@ -419,8 +425,8 @@ export function createTools(
       }
 
       const stmt = db.prepare(`
-        INSERT INTO lessons (content, category, tags, project, source, severity)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO lessons (content, category, tags, project, source, severity, scope)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
 
       const result = stmt.run(
@@ -429,7 +435,8 @@ export function createTools(
         JSON.stringify(tags || []),
         resolvedProject,
         source || null,
-        severity || "info"
+        severity || "info",
+        scope || "project"
       );
 
       // Optional: embed on write. Failure never blocks the save — the lesson

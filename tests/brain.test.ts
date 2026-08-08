@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { z } from "zod";
 import type Database from "better-sqlite3";
+import DatabaseCtor from "better-sqlite3";
 import {
   initDB,
   createTools,
@@ -96,6 +97,67 @@ test("brain_learn stores a lesson and brain_recall finds it via FTS", async () =
   const text = textOf(found);
   assert.match(text, /Found \d+ lessons/);
   assert.ok(text.includes("Cloudflare D1 does not support"), "recall returns the stored lesson");
+});
+
+test("brain_learn defaults to project scope and can mark a lesson global", async () => {
+  // A lesson about a TOOL rather than a project — a shell trap, a git behaviour —
+  // recurs everywhere, and filing it under whichever project happened to be open
+  // is what made it invisible where the mistake repeats. The UserPromptSubmit
+  // hook boosts `global`, so nothing may quietly write the wrong default.
+  const learn = toolByName("brain_learn");
+
+  await learn.handler({
+    content: "set -o pipefail plus a pipe into head kills the script with exit 141",
+    category: "gotcha",
+    severity: "critical",
+    scope: "global",
+  });
+  await learn.handler({
+    content: "The staging invoice exporter needs the VAT column ordered last",
+    category: "tooling",
+  });
+
+  const rows = db
+    .prepare("SELECT content, scope FROM lessons WHERE content LIKE ? OR content LIKE ?")
+    .all("%pipefail%", "%invoice exporter%") as { content: string; scope: string }[];
+
+  const trap = rows.find((r) => r.content.includes("pipefail"));
+  const local = rows.find((r) => r.content.includes("invoice exporter"));
+  assert.equal(trap?.scope, "global");
+  assert.equal(local?.scope, "project", "the default must stay project-scoped");
+});
+
+test("initDB migrates an existing database to the retrieval columns", async () => {
+  // The hooks perform the same migration in Python when they run without the
+  // server. Two descriptions of one schema is exactly the pair that drifts, so
+  // both sides are asserted — here, and in tests/hooks/test_hooks.py.
+  const legacy = join(workDir, "legacy.db");
+  const raw = new DatabaseCtor(legacy);
+  raw.exec(`
+    CREATE TABLE lessons (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]',
+      content TEXT NOT NULL, source TEXT, project TEXT,
+      severity TEXT DEFAULT 'info',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  raw.prepare("INSERT INTO lessons (category, content) VALUES ('gotcha','older than the columns')").run();
+  raw.close();
+
+  const migrated = initDB(legacy);
+  const cols = new Set(
+    (migrated.prepare("PRAGMA table_info(lessons)").all() as { name: string }[]).map((c) => c.name)
+  );
+  for (const name of ["shown_count", "last_shown_at", "scope"]) {
+    assert.ok(cols.has(name), `${name} was not added to an existing database`);
+  }
+  const row = migrated.prepare("SELECT shown_count, scope FROM lessons").get() as
+    { shown_count: number; scope: string };
+  assert.equal(row.shown_count, 0, "existing rows start uncounted");
+  assert.equal(row.scope, "project", "existing rows default to project scope");
+  migrated.close();
 });
 
 test("brain_recall with empty query lists recent lessons, with category filter", async () => {
