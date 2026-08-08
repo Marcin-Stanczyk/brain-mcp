@@ -33,7 +33,18 @@ export function initDB(dbPath: string): Database.Database {
       project TEXT,
       severity TEXT DEFAULT 'info',
       created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
+      updated_at TEXT DEFAULT (datetime('now')),
+      -- Retrieval instrumentation. Before these existed neither the system nor
+      -- its author could answer "is any of this ever read?", which made every
+      -- argument about recall a matter of impression.
+      -- NOTE: nothing may set updated_at when these change. Recording that a
+      -- lesson was shown must not make it look freshly written, or showing a
+      -- lesson would promote it in the recency-ordered session digest forever.
+      shown_count INTEGER NOT NULL DEFAULT 0,
+      last_shown_at TEXT,
+      -- 'project' | 'global'. A lesson about a TOOL rather than a project —
+      -- a bash trap, a git behaviour, an API limit — belongs everywhere.
+      scope TEXT NOT NULL DEFAULT 'project'
     );
 
     CREATE TABLE IF NOT EXISTS project_index (
@@ -92,6 +103,22 @@ export function initDB(dbPath: string): Database.Database {
       VALUES (new.id, new.content, new.category, new.tags, new.source, new.project);
     END;
   `);
+
+  // Existing databases predate the three columns above. Kept in step with
+  // hooks/_brain_db.py:EXTRA_COLUMNS, which performs the same migration when the
+  // hooks run without the server — the tests assert the two agree, because two
+  // descriptions of one schema are exactly the kind of pair that drifts.
+  const existing = new Set(
+    (db.prepare("PRAGMA table_info(lessons)").all() as { name: string }[]).map((c) => c.name)
+  );
+  const LATE_COLUMNS: Record<string, string> = {
+    shown_count: "INTEGER NOT NULL DEFAULT 0",
+    last_shown_at: "TEXT",
+    scope: "TEXT NOT NULL DEFAULT 'project'",
+  };
+  for (const [name, decl] of Object.entries(LATE_COLUMNS)) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE lessons ADD COLUMN ${name} ${decl}`);
+  }
 
   return db;
 }

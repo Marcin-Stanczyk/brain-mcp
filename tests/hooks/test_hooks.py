@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Tests for the hooks.
+
+The hooks had no tests at all while `src/` had 39, and they are the only
+mechanism by which anything stored here ever reaches an agent. Every bug found in
+the sibling project during the same audit lived on exactly this kind of boundary:
+a well-reasoned core, and an untested edge where it meets the outside world.
+
+A hook is a pure function of (stdin payload, database, cwd) -> (stdout, exit
+code), which makes this straightforward. Run with:
+
+    python3 -m unittest discover -s tests/hooks -v
+    tests/hooks/test_hooks.py            (same thing, shorter)
+
+Standard library only, deliberately: the hooks themselves depend on nothing, and
+a suite that needed `pytest` would not be run on a machine where the hooks are
+misbehaving.
+"""
+
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HOOKS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "hooks")
+sys.path.insert(0, HOOKS)
+
+
+def make_db(path, lessons):
+    """A database with the real schema, so FTS5 and the triggers behave as they do live."""
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE lessons (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          category TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]',
+          content TEXT NOT NULL, source TEXT, project TEXT,
+          severity TEXT DEFAULT 'info',
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE VIRTUAL TABLE lessons_fts USING fts5(
+          content, category, tags, source, project,
+          content='lessons', content_rowid='id');
+        CREATE TRIGGER lessons_ai AFTER INSERT ON lessons BEGIN
+          INSERT INTO lessons_fts(rowid, content, category, tags, source, project)
+          VALUES (new.id, new.content, new.category, new.tags, new.source, new.project);
+        END;
+        CREATE TRIGGER lessons_au AFTER UPDATE ON lessons BEGIN
+          INSERT INTO lessons_fts(lessons_fts, rowid, content, category, tags, source, project)
+          VALUES ('delete', old.id, old.content, old.category, old.tags, old.source, old.project);
+          INSERT INTO lessons_fts(rowid, content, category, tags, source, project)
+          VALUES (new.id, new.content, new.category, new.tags, new.source, new.project);
+        END;
+        """
+    )
+    for lesson in lessons:
+        # created_at/updated_at are pinned to a fixed past instant. Left to
+        # `datetime('now')` they land in the same SECOND as anything the hook
+        # writes, and a test asserting "updated_at did not change" then passes
+        # whether or not it changed. That exact coincidence hid a deliberately
+        # broken build once; pinning it is the fix.
+        con.execute(
+            "INSERT INTO lessons (category, content, project, severity, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (lesson.get("category", "gotcha"), lesson["content"],
+             lesson.get("project", "p"), lesson.get("severity", "info"),
+             "2020-01-01 00:00:00", "2020-01-01 00:00:00"),
+        )
+    con.commit()
+    con.close()
+
+
+class HookCase(unittest.TestCase):
+    """A throwaway database and state directory per test."""
+
+    lessons = []
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="brain-hooks-")
+        self.db = os.path.join(self.tmp, "knowledge.db")
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.state)
+        make_db(self.db, self.lessons)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_hook(self, name, payload, env=None, db=None):
+        e = dict(os.environ)
+        e["BRAIN_DB"] = db if db is not None else self.db
+        e["BRAIN_STATE_DIR"] = self.state
+        e.pop("BRAIN_HOOK_GLOBAL_PROJECTS", None)
+        if env:
+            e.update(env)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HOOKS, name)],
+            input=json.dumps(payload) if isinstance(payload, (dict, list)) else payload,
+            capture_output=True, text=True, env=e, timeout=30,
+        )
+        return proc
+
+    def context_of(self, proc):
+        """The additionalContext a hook emitted, or None when it stayed silent."""
+        out = proc.stdout.strip()
+        if not out:
+            return None
+        return json.loads(out)["hookSpecificOutput"]["additionalContext"]
+
+    def lesson_row(self, lesson_id):
+        con = sqlite3.connect(self.db)
+        try:
+            cols = [r[1] for r in con.execute("PRAGMA table_info(lessons)")]
+            row = con.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
+            return dict(zip(cols, row))
+        finally:
+            con.close()
+
+
+# ---------------------------------------------------------------------------
+# _brain_db
+# ---------------------------------------------------------------------------
+class TestBrainDB(unittest.TestCase):
+    def setUp(self):
+        import _brain_db
+        self.bd = _brain_db
+
+    def test_fts_query_drops_punctuation_and_short_words(self):
+        q = self.bd.fts_query("exit 141?! -- pipefail & head (SIGPIPE)")
+        self.assertIn('"pipefail"', q)
+        self.assertIn('"sigpipe"', q)
+        self.assertIn('"141"', q)
+        self.assertNotIn("&", q)
+        self.assertNotIn("(", q)
+
+    def test_fts_query_quotes_fts5_keywords(self):
+        # Unquoted, NEAR/AND/OR are syntax and the whole query fails to parse —
+        # which in a hook means silence that looks exactly like "no matches".
+        q = self.bd.fts_query("near and or not the value")
+        for term in q.split(" OR "):
+            self.assertTrue(term.startswith('"') and term.endswith('"'), term)
+
+    def test_fts_query_is_an_or_query(self):
+        # AND over a whole sentence matches nothing at all.
+        q = self.bd.fts_query("silent failure in the bash script")
+        self.assertIn(" OR ", q)
+
+    def test_fts_query_empty_for_nothing_searchable(self):
+        self.assertEqual("", self.bd.fts_query(""))
+        self.assertEqual("", self.bd.fts_query("a to i"))
+        self.assertEqual("", self.bd.fts_query(None))
+
+    def test_fts_query_deduplicates(self):
+        q = self.bd.fts_query("bash bash bash script")
+        self.assertEqual(1, q.count('"bash"'))
+
+    def test_migrate_is_idempotent_and_adds_every_column(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            db = os.path.join(tmp, "k.db")
+            make_db(db, [{"content": "x"}])
+            con = sqlite3.connect(db)
+            self.assertTrue(self.bd.migrate(con))
+            first = self.bd.columns(con)
+            for name in self.bd.EXTRA_COLUMNS:
+                self.assertIn(name, first)
+            self.assertTrue(self.bd.migrate(con))          # again, no error
+            self.assertEqual(first, self.bd.columns(con))  # and no change
+            con.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_connect_returns_none_for_a_missing_database(self):
+        self.assertIsNone(self.bd.connect(readonly=True, timeout=0.2) if False else None)
+        old = self.bd.DB
+        try:
+            self.bd.DB = "/nowhere/at/all/k.db"
+            self.assertIsNone(self.bd.connect(readonly=True))
+        finally:
+            self.bd.DB = old
+
+    def test_schema_agrees_with_typescript(self):
+        # The one guard against the failure mode this project's sibling was just
+        # fixed for: two descriptions of one schema, drifting quietly apart.
+        src = os.path.join(os.path.dirname(HOOKS), "src", "tools.ts")
+        with open(src) as f:
+            ts = f.read()
+        for name in self.bd.EXTRA_COLUMNS:
+            self.assertIn(name, ts, f"{name} is migrated by the hooks but absent from src/tools.ts")
+
+
+# ---------------------------------------------------------------------------
+# relevant_lessons — the hook that makes retrieval happen when it matters
+# ---------------------------------------------------------------------------
+BASH_TRAP = (
+    "PULAPKA: set -euo pipefail plus a pipe into head is a silent death with "
+    "exit 141. head closes the pipe, the producer takes SIGPIPE, pipefail "
+    "propagates 141 and set -e ends the script with no message at all."
+)
+WOO_LESSON = (
+    "WooCommerce checkout gateway list must be filtered before the payment "
+    "step or BLIK disappears from the mobile view."
+)
+
+
+class TestRelevantLessons(HookCase):
+    lessons = [
+        {"content": BASH_TRAP, "project": "agent-worktrees", "severity": "critical", "category": "gotcha"},
+        {"content": WOO_LESSON, "project": "kamar", "severity": "important", "category": "bug-fix"},
+        {"content": "Unrelated note about invoice numbering in the ERP export.",
+         "project": "elogic", "severity": "info", "category": "tooling"},
+    ]
+
+    def ask(self, prompt, cwd="/x/kamar", session="s1", env=None):
+        return self.run_hook("relevant_lessons.py",
+                             {"prompt": prompt, "cwd": cwd, "session_id": session}, env=env)
+
+    def test_finds_a_lesson_filed_under_a_different_project(self):
+        # THE POINT OF THE WHOLE HOOK. Under project-scoped recall this lesson
+        # was invisible outside agent-worktrees, so the same trap in another
+        # repository met an agent that had never heard of it.
+        ctx = self.context_of(self.ask("my bash script dies with exit 141 and pipefail, no message"))
+        self.assertIsNotNone(ctx, "nothing was surfaced at all")
+        self.assertIn("SIGPIPE", ctx)
+        self.assertIn("agent-worktrees", ctx)
+
+    def test_stays_silent_when_nothing_matches(self):
+        # Silence is a feature: an irrelevant hit is what teaches somebody to
+        # stop reading the block that will one day matter.
+        self.assertIsNone(self.context_of(self.ask("rename the marketing headline on the pricing page")))
+
+    def test_stays_silent_for_a_prompt_with_nothing_to_search_for(self):
+        for prompt in ("ok", "tak", "   ", "go on"):
+            self.assertIsNone(self.context_of(self.ask(prompt)), prompt)
+
+    def test_the_current_project_wins_a_tie(self):
+        # Both lessons mention "checkout"; the one from the open project should
+        # come first — but only as a tie-break, never as a filter.
+        ctx = self.context_of(self.ask("checkout gateway BLIK disappears on mobile payment step"))
+        self.assertIsNotNone(ctx)
+        self.assertIn("BLIK", ctx)
+        self.assertIn("this project", ctx)
+
+    def test_does_not_repeat_within_a_session(self):
+        first = self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE silent"))
+        self.assertIsNotNone(first)
+        second = self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE silent"))
+        self.assertIsNone(second, "the same lesson was pushed twice in one session")
+
+    def test_a_different_session_sees_it_again(self):
+        self.assertIsNotNone(self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE", session="a")))
+        self.assertIsNotNone(self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE", session="b")))
+
+    def test_records_that_a_lesson_was_shown(self):
+        before = self.lesson_row(1)
+        self.assertEqual(0, before.get("shown_count", 0) or 0)
+        self.ask("bash pipefail head exit 141 SIGPIPE silent")
+        after = self.lesson_row(1)
+        self.assertEqual(1, after["shown_count"])
+        self.assertIsNotNone(after["last_shown_at"])
+
+    def test_showing_a_lesson_does_not_make_it_look_freshly_written(self):
+        # If it did, every lesson shown once would float to the top of the
+        # recency-ordered session digest and stay there — the instrumentation
+        # would quietly corrupt the thing it was added to measure.
+        before = self.lesson_row(1)["updated_at"]
+        self.ask("bash pipefail head exit 141 SIGPIPE silent")
+        self.assertEqual(before, self.lesson_row(1)["updated_at"])
+
+    def test_honours_the_lesson_limit(self):
+        ctx = self.context_of(self.ask(
+            "bash pipefail SIGPIPE checkout gateway BLIK invoice numbering ERP export",
+            env={"BRAIN_PROMPT_MAX_LESSONS": "1"}))
+        self.assertIsNotNone(ctx)
+        self.assertEqual(1, ctx.count("\n### #"))
+
+    def test_output_is_a_well_formed_UserPromptSubmit_payload(self):
+        proc = self.ask("bash pipefail head exit 141 SIGPIPE silent")
+        payload = json.loads(proc.stdout)
+        self.assertEqual("UserPromptSubmit", payload["hookSpecificOutput"]["hookEventName"])
+        self.assertIsInstance(payload["hookSpecificOutput"]["additionalContext"], str)
+
+
+class TestRelevantLessonsNeverBreaksASession(HookCase):
+    lessons = [{"content": BASH_TRAP, "project": "agent-worktrees", "severity": "critical"}]
+
+    def assert_silent_success(self, proc):
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("", proc.stdout.strip())
+        self.assertEqual("", proc.stderr.strip())
+
+    def test_malformed_json(self):
+        self.assert_silent_success(self.run_hook("relevant_lessons.py", "{not json at all"))
+
+    def test_empty_stdin(self):
+        self.assert_silent_success(self.run_hook("relevant_lessons.py", ""))
+
+    def test_payload_without_a_prompt(self):
+        self.assert_silent_success(self.run_hook("relevant_lessons.py", {"cwd": "/x/y"}))
+
+    def test_missing_database(self):
+        self.assert_silent_success(
+            self.run_hook("relevant_lessons.py",
+                          {"prompt": "bash pipefail SIGPIPE head exit"},
+                          db=os.path.join(self.tmp, "nope.db")))
+
+    def test_corrupt_database(self):
+        bad = os.path.join(self.tmp, "corrupt.db")
+        with open(bad, "wb") as f:
+            f.write(b"this is definitely not sqlite" * 100)
+        self.assert_silent_success(
+            self.run_hook("relevant_lessons.py",
+                          {"prompt": "bash pipefail SIGPIPE head exit"}, db=bad))
+
+    def test_read_only_database_still_answers(self):
+        # Instrumentation is worth having and not worth failing for: the lesson
+        # must still be delivered when the counter cannot be written.
+        os.chmod(self.db, 0o444)
+        os.chmod(self.tmp, 0o555)
+        try:
+            proc = self.run_hook("relevant_lessons.py",
+                                 {"prompt": "bash pipefail head exit 141 SIGPIPE silent",
+                                  "session_id": "ro"})
+            self.assertEqual(0, proc.returncode)
+            self.assertIn("SIGPIPE", self.context_of(proc) or "")
+        finally:
+            os.chmod(self.tmp, 0o755)
+            os.chmod(self.db, 0o644)
+
+    def test_unwritable_state_directory(self):
+        os.chmod(self.state, 0o555)
+        try:
+            proc = self.run_hook("relevant_lessons.py",
+                                 {"prompt": "bash pipefail head exit 141 SIGPIPE silent"})
+            self.assertEqual(0, proc.returncode, proc.stderr)
+        finally:
+            os.chmod(self.state, 0o755)
+
+
+class TestProjectName(unittest.TestCase):
+    def test_worktrees_inherit_their_parent_project(self):
+        import relevant_lessons as rl
+        self.assertEqual("myapp", rl.project_name("/code/myapp"))
+        self.assertEqual("myapp", rl.project_name("/code/myapp-session-payments"))
+        self.assertEqual("myapp", rl.project_name("/code/myapp-hotfix-urgent"))
+        self.assertEqual("my-app", rl.project_name("/code/my-app"))
+
+
+# ---------------------------------------------------------------------------
+# session_context
+# ---------------------------------------------------------------------------
+class TestSessionContext(HookCase):
+    lessons = (
+        [{"content": f"critical lesson number {i} about deployment", "project": "kamar",
+          "severity": "critical"} for i in range(20)]
+        + [{"content": "an info lesson about kamar styling", "project": "kamar", "severity": "info"}]
+    )
+
+    def test_injects_the_project_digest(self):
+        ctx = self.context_of(self.run_hook("session_context.py",
+                                            {"cwd": "/code/kamar", "session_id": "s"}))
+        self.assertIsNotNone(ctx)
+        self.assertIn("brain-mcp memory", ctx)
+
+    def test_honours_the_lesson_limit(self):
+        proc = self.run_hook("session_context.py", {"cwd": "/code/kamar", "session_id": "s"},
+                             env={"BRAIN_HOOK_MAX_LESSONS": "5"})
+        ctx = self.context_of(proc)
+        self.assertIn("(5 lessons)", ctx)
+
+    def test_writes_the_baseline_the_stop_hook_needs(self):
+        self.run_hook("session_context.py", {"cwd": "/code/kamar", "session_id": "sess-x"})
+        marker = os.path.join(self.state, "sess-x.json")
+        self.assertTrue(os.path.exists(marker))
+        with open(marker) as f:
+            self.assertEqual(21, json.load(f)["baseline_lessons"])
+
+    def test_a_worktree_inherits_the_parent_project(self):
+        ctx = self.context_of(self.run_hook("session_context.py",
+                                            {"cwd": "/code/kamar-session-payments", "session_id": "s"}))
+        self.assertIsNotNone(ctx, "a session cut from kamar saw none of kamar's lessons")
+
+    def test_survives_a_missing_database(self):
+        proc = self.run_hook("session_context.py", {"cwd": "/code/kamar", "session_id": "s"},
+                             db=os.path.join(self.tmp, "gone.db"))
+        self.assertEqual(0, proc.returncode)
+
+    def test_survives_malformed_input(self):
+        proc = self.run_hook("session_context.py", "{{{")
+        self.assertEqual(0, proc.returncode)
+
+
+# ---------------------------------------------------------------------------
+# capture_lesson
+# ---------------------------------------------------------------------------
+class TestCaptureLesson(HookCase):
+    lessons = [{"content": "something already known", "project": "kamar"}]
+
+    def baseline(self, session, n=1, **extra):
+        os.makedirs(self.state, exist_ok=True)
+        state = {"started": 0, "baseline_lessons": n}
+        state.update(extra)
+        with open(os.path.join(self.state, f"{session}.json"), "w") as f:
+            json.dump(state, f)
+
+    def test_blocks_when_nothing_was_learned(self):
+        self.baseline("s1")
+        proc = self.run_hook("capture_lesson.py", {"session_id": "s1", "cwd": "/code/kamar"})
+        self.assertEqual("block", json.loads(proc.stdout)["decision"])
+
+    def test_does_not_block_when_a_lesson_was_written(self):
+        self.baseline("s2", n=0)   # baseline lower than the current count
+        proc = self.run_hook("capture_lesson.py", {"session_id": "s2", "cwd": "/code/kamar"})
+        self.assertEqual("", proc.stdout.strip())
+
+    def test_never_blocks_a_continuation(self):
+        # Blocking a turn that is already the result of a block is how a hook
+        # turns into an infinite loop the user has to kill.
+        self.baseline("s3")
+        proc = self.run_hook("capture_lesson.py",
+                             {"session_id": "s3", "cwd": "/code/kamar", "stop_hook_active": True})
+        self.assertEqual("", proc.stdout.strip())
+
+    def test_blocks_at_most_once_per_session(self):
+        self.baseline("s4")
+        first = self.run_hook("capture_lesson.py", {"session_id": "s4", "cwd": "/code/kamar"})
+        self.assertEqual("block", json.loads(first.stdout)["decision"])
+        second = self.run_hook("capture_lesson.py", {"session_id": "s4", "cwd": "/code/kamar"})
+        self.assertEqual("", second.stdout.strip())
+
+    def test_does_nothing_without_a_baseline(self):
+        proc = self.run_hook("capture_lesson.py", {"session_id": "unknown", "cwd": "/code/kamar"})
+        self.assertEqual(0, proc.returncode)
+        self.assertEqual("", proc.stdout.strip())
+
+    def test_survives_malformed_input(self):
+        self.assertEqual(0, self.run_hook("capture_lesson.py", "nonsense").returncode)
+
+
+# ---------------------------------------------------------------------------
+# incident_watch
+# ---------------------------------------------------------------------------
+class TestIncidentWatch(HookCase):
+    lessons = []
+
+    def test_survives_malformed_input(self):
+        self.assertEqual(0, self.run_hook("incident_watch.py", "{oops").returncode)
+
+    def test_survives_an_empty_payload(self):
+        self.assertEqual(0, self.run_hook("incident_watch.py", {}).returncode)
+
+    def test_ignores_an_ordinary_command(self):
+        proc = self.run_hook("incident_watch.py", {
+            "session_id": "s", "cwd": "/code/kamar",
+            "tool_name": "Bash", "tool_input": {"command": "ls -la"},
+            "tool_response": {"stdout": "", "exit_code": 0}})
+        self.assertEqual(0, proc.returncode)
+        self.assertEqual("", proc.stdout.strip())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

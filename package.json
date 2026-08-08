@@ -1,7 +1,7 @@
 {
   "name": "brain-mcp",
   "version": "1.1.0",
-  "description": "Local MCP memory server — persistent SQLite knowledge base for AI coding assistants",
+  "description": "Local MCP memory server \u2014 persistent SQLite knowledge base for AI coding assistants",
   "author": "Marcin Stanczyk",
   "license": "MIT",
   "type": "module",
@@ -18,7 +18,9 @@
     "hooks:install": "node scripts/install-hooks.mjs",
     "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
     "hooks:status": "node scripts/install-hooks.mjs --dry-run",
-    "postinstall": "node scripts/postinstall-notice.mjs"
+    "postinstall": "node scripts/postinstall-notice.mjs",
+    "test:hooks": "python3 -m unittest discover -s tests/hooks",
+    "test:all": "npm test && npm run test:hooks"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

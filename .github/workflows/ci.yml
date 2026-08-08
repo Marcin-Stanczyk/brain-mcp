@@ -28,5 +28,12 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test
+      - name: Test (MCP server)
         run: npm test
+
+      # The hooks are the only mechanism by which anything stored here reaches an
+      # agent, and they had no tests at all while src/ had 39. They are plain
+      # Python with no dependencies, so this needs no setup beyond the runner's
+      # own interpreter.
+      - name: Test (hooks)
+        run: python3 -m unittest discover -s tests/hooks -v
