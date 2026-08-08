@@ -22,7 +22,10 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import type Database from "better-sqlite3";
 import { initDB, createTools, type ToolDef } from "../src/tools.js";
-import { planFtsQuery, tokenizeQuery, stemForPrefix, STOPWORDS, FTS_MIN_TERM_LEN } from "../src/query.js";
+import {
+  planFtsQuery, tokenizeQuery, stemForPrefix,
+  STOPWORDS, FTS_MIN_TERM_LEN, STEM_CAP, STEM_MIN_LEN,
+} from "../src/query.js";
 import { rrfFuse } from "../src/embeddings.js";
 
 let workDir: string;
@@ -151,8 +154,14 @@ test("an inflected Polish noun still finds the lesson written in another case", 
 test("stemming leaves short terms alone", () => {
   assert.equal(stemForPrefix("eval"), "eval", "trimming 'eval' would match half the base");
   assert.equal(stemForPrefix("wp"), "wp");
-  assert.equal(stemForPrefix("zamówień"), "zamówi");
-  assert.equal(stemForPrefix("backfill"), "backfi");
+  // Two inflections only meet at the stem they share, and it is short: a fixed
+  // trim of two characters turns "zamówieniach" into "zamówienia", which still
+  // does not reach a lesson that says "zamówień".
+  assert.equal(stemForPrefix("zamówień"), "zamów");
+  assert.equal(stemForPrefix("zamówieniach"), "zamów", "and both inflections land on it");
+  assert.equal(stemForPrefix("kosztach"), "koszt");
+  assert.equal(stemForPrefix("koszty"), "koszt", "symmetrically — asymmetric stemming finds one direction only");
+  assert.equal(stemForPrefix("backfill"), "backf");
 });
 
 // ── The query planner ───────────────────────────────────────────────────────
@@ -162,8 +171,8 @@ test("planFtsQuery builds precise, forgiving and morphological variants", () => 
   assert.deepEqual(plan.terms, ["koszty", "zamówień", "backfill"]);
   assert.equal(plan.all, '"koszty" AND "zamówień" AND "backfill"');
   assert.equal(plan.any, '"koszty" OR "zamówień" OR "backfill"');
-  assert.equal(plan.prefix, '"koszty"* OR "zamówi"* OR "backfi"*',
-    "six-letter 'koszty' is left whole; only terms long enough to survive it are trimmed");
+  assert.equal(plan.prefix, '"koszt"* OR "zamów"* OR "backf"*',
+    "anything long enough to be inflected is cut to the shared root");
 });
 
 test("a single-term query has no all-terms variant, and an unstemmable one no prefix variant", () => {
@@ -253,17 +262,15 @@ test("the TypeScript and Python tokenizers agree on what counts as a search term
   assert.ok(pyMinLen, "hooks/_brain_db.py still filters by term length");
   assert.equal(Number(pyMinLen![1]), FTS_MIN_TERM_LEN, "minimum term length agrees");
 
-  const pyStemLen = py.match(/w\[:-2\]\s*if\s*len\(w\)\s*>=\s*(\d+)/);
-  assert.ok(pyStemLen, "hooks/_brain_db.py still stems long terms");
-  const tsStemThreshold = Number(pyStemLen![1]);
+  const pyStem = py.match(/w\[:(\d+)\]\s*if\s*len\(w\)\s*>=\s*(\d+)/);
+  assert.ok(pyStem, "hooks/_brain_db.py still stems long terms");
+  const [pyCap, pyMin] = [Number(pyStem![1]), Number(pyStem![2])];
+  assert.equal(pyCap, STEM_CAP, "the stemming cap agrees with hooks/_brain_db.py");
+  assert.equal(pyMin, STEM_MIN_LEN, "and so does the length at which stemming starts");
+  assert.equal(stemForPrefix("x".repeat(STEM_MIN_LEN)).length, STEM_CAP);
   assert.equal(
-    stemForPrefix("x".repeat(tsStemThreshold)).length,
-    tsStemThreshold - 2,
-    "the stemming threshold agrees with hooks/_brain_db.py"
-  );
-  assert.equal(
-    stemForPrefix("x".repeat(tsStemThreshold - 1)).length,
-    tsStemThreshold - 1,
-    "and so does the point below which nothing is trimmed"
+    stemForPrefix("x".repeat(STEM_MIN_LEN - 1)).length,
+    STEM_MIN_LEN - 1,
+    "shorter terms are left whole"
   );
 });

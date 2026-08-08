@@ -1,0 +1,235 @@
+{
+  "_readme": [
+    "Fixture knowledge base for the retrieval eval. Deliberately committed, so the",
+    "numbers in tests/eval.test.ts mean the same thing on every machine and in CI —",
+    "the real base is personal, gitignored, and changes every session.",
+    "",
+    "Shaped after the real one rather than invented: Polish and English mixed inside",
+    "single lessons, inflected nouns, project-scoped lessons that are really about a",
+    "tool, one lesson long enough to be penalised by bm25 length normalisation, and",
+    "distractors that share vocabulary with the queries without answering them.",
+    "",
+    "`key` is the stable identity. Never renumber; add to the end."
+  ],
+  "lessons": [
+    {
+      "key": "wp-eval-production",
+      "category": "tooling",
+      "project": "kamar",
+      "severity": "critical",
+      "content": "wp eval to jedyny bezpieczny sposób na jednorazowy skrypt przeciwko produkcji. Kod leci w pełnym kontekście WordPressa, więc hooki i filtry działają — inaczej niż przy surowym SQL, który omija całą logikę WooCommerce."
+    },
+    {
+      "key": "koszty-zamowien-woo",
+      "category": "architecture",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Koszty zamówień liczone są po stronie WooCommerce, nie w bazie. Zapytanie SQL po wp_postmeta pokaże inną liczbę niż panel, bo panel dolicza podatek zgodnie z woocommerce_prices_include_tax."
+    },
+    {
+      "key": "backfill-partiami",
+      "category": "gotcha",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Backfill historycznych danych puszczaj partiami po 500 rekordów. Jednym strzałem po całej tabeli zamówień proces przekracza limit pamięci PHP i przerywa się w połowie, zostawiając stan niedokończony."
+    },
+    {
+      "key": "bash-pipefail-head",
+      "category": "gotcha",
+      "project": "claude-code-setup",
+      "severity": "critical",
+      "scope": "global",
+      "content": "PUŁAPKA: set -euo pipefail w połączeniu z `jakas_funkcja | head -N` kończy skrypt kodem 141. head zamyka potok po N liniach, producent dostaje SIGPIPE, a pipefail podnosi to do błędu całego skryptu. Objawia się jako ciche przerwanie bez komunikatu."
+    },
+    {
+      "key": "git-checkout-mutation",
+      "category": "testing",
+      "project": "kamar",
+      "severity": "critical",
+      "scope": "global",
+      "content": "NAJPIERW commit poprawki, DOPIERO POTEM test mutacyjny. `git checkout -- <plik>` przywraca stan z HEAD, więc cofa nie tylko wprowadzoną mutację, ale też twoją niezacommitowaną poprawkę produkcyjną. git status pokaże wtedy tylko zmienione pliki testowe i wygląda to niewinnie."
+    },
+    {
+      "key": "protected-branch-deploy",
+      "category": "deployment",
+      "project": "kamar",
+      "severity": "critical",
+      "scope": "global",
+      "content": "Żaden krok wdrożeniowy nie może WYMAGAĆ zapisu do chronionej gałęzi. Ochrona odbija każdy push, więc pętla retry z rebase nie ma szans. Licznik wydań ma mieszkać tam, gdzie leży wydanie, a nie w repo."
+    },
+    {
+      "key": "fts5-implicit-and",
+      "category": "bug-fix",
+      "project": "brain-mcp",
+      "severity": "critical",
+      "scope": "global",
+      "content": "FTS5 łączy gołe termy niejawnym AND, więc zapytanie zbudowane ze zdania żąda jednej lekcji zawierającej każde słowo pytania i nie zwraca nic. Te same termy połączone OR zwracają setki wierszy. Objaw jest mylący: baza wiedzy wygląda na pustą."
+    },
+    {
+      "key": "sqlite-wal-busy-timeout",
+      "category": "architecture",
+      "project": "brain-mcp",
+      "severity": "important",
+      "content": "Wiele instancji serwera MCP dzieli jedną bazę SQLite. Tryb WAL pozwala na równoległe odczyty i serializowane zapisy, ale bez pragmy busy_timeout równoczesne zapisy padają cicho jako SQLITE_BUSY."
+    },
+    {
+      "key": "native-module-abi",
+      "category": "tooling",
+      "project": "brain-mcp",
+      "severity": "critical",
+      "scope": "global",
+      "content": "NODE_MODULE_VERSION mismatch: moduł natywny skompilowany pod jedną wersję node odmawia załadowania pod inną. Przy menedżerze wersji `command: node` w konfiguracji MCP to rzut monetą, bo rozwiązuje się przez PATH. Serwer ginie przed handshakiem, więc klient raportuje problem z połączeniem, a nie z ABI."
+    },
+    {
+      "key": "infakt-cod-skip",
+      "category": "financial",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Automatyczna faktura InFakt odpala się na przejściu zamówienia w status completed. Zamówienia za pobraniem mają być pominięte — filtr opcji musi działać globalnie, nie tylko w kontekście admina, bo domknięcie zamówienia leci z Action Schedulera."
+    },
+    {
+      "key": "payu-blik-timeout",
+      "category": "bug-fix",
+      "project": "kamar",
+      "severity": "important",
+      "content": "PayU BLIK potrafi zwrócić potwierdzenie po timeoucie po stronie sklepu. Zamówienie zostaje wtedy w pending, mimo że płatność przeszła. Notyfikacja IPN jest źródłem prawdy, nie odpowiedź synchroniczna."
+    },
+    {
+      "key": "woo-price-includes-tax",
+      "category": "financial",
+      "project": "kamar",
+      "severity": "critical",
+      "content": "Koszt dostawcy jest NETTO, a cena sklepowa BRUTTO. Liczenie marży bez tego rozróżnienia zawyża wynik o pełny VAT należny i potrafi zamienić stratę na pozorny zysk."
+    },
+    {
+      "key": "finance-margin-long",
+      "category": "financial",
+      "project": "kamar",
+      "severity": "critical",
+      "content": "USTALENIE — pełny rozbiór rachunku marży w module Finanse, bo komentarze w kodzie twierdziły coś odwrotnego niż dane.\n\nOBJAW. Badge MARŻA pokazywał +16 zł na zamówienie przy rzeczywistym wyniku −17,33 zł. Różnica domyka się co do grosza, więc nie jest to szacunek ani błąd zaokrągleń.\n\nCAUSE. financeRevenue.php miał nagłówek twierdzący, że kwoty są brutto po obu stronach. kamar-import-pricing.php opisywał parametr jako cenę brutto z XML dostawcy. Oba opisy były nieprawdziwe: feed dostawcy podaje cenę i stawkę VAT w osobnych polach, a import zapisuje wartość netto.\n\nDOWÓD, TRZY NIEZALEŻNE DROGI. Po pierwsze, struktura feedu rozdziela price i tax, więc wartość zapisywana jako cena nie może być brutto. Po drugie, tabela marż mnoży tę cenę przez mnożnik progowy, żeby dopiero uzyskać cenę detaliczną — kontrola na pojedynczym zamówieniu: koszt 26,12, próg 25-30, mnożnik 2,33, wynik 60,86, zaokrąglenie do końcówki 99 daje 59,99, i dokładnie tyle wynosi cena w sklepie. Po trzecie, stosunek rzeczywistego kosztu dostawcy do sumy cen netto z feedu wynosi 1,0631 na próbce 1632 zamówień, co odpowiada mieszance stawek VAT, a nie jedności.\n\nSKUTEK FINANSOWY. Zawyżenie o 33,70 zł na zamówieniu, czyli 56 738 zł w oknie 90 dni. Decyzje o asortymencie podejmowane na tym badge'u były podejmowane na odwróconym znaku.\n\nNAPRAWA. Rachunek sprowadza obie strony do netto przed odjęciem, a komentarze w obu plikach zostały poprawione i opatrzone odsyłaczem do tej lekcji. Test regresyjny liczy marżę na zamówieniu kontrolnym i porównuje z wartością wyliczoną ręcznie.\n\nZASADA OGÓLNA. Komentarz opisujący jednostkę kwoty jest twierdzeniem o danych i wymaga dowodu z danych. Dwa pliki opisujące tę samą wielkość to para, która się rozjedzie — a rozjazd jest cichy, bo liczba dalej się wyświetla."
+    },
+    {
+      "key": "cloudflare-d1-alter",
+      "category": "gotcha",
+      "project": "kanarix",
+      "severity": "important",
+      "scope": "global",
+      "content": "Cloudflare D1 nie obsługuje ALTER TABLE z dodaniem klucza obcego. Migrację trzeba zrobić przez utworzenie nowej tabeli, przepisanie danych i podmianę nazwy."
+    },
+    {
+      "key": "hetzner-litespeed-cache",
+      "category": "performance",
+      "project": "kanarix",
+      "severity": "important",
+      "content": "LiteSpeed cache trzeba czyścić po deployu, inaczej stary HTML wisi mimo poprawnego kodu na dysku. Purge przez CLI jest częścią pipeline'u, nie czynnością ręczną."
+    },
+    {
+      "key": "react-hydration-mismatch",
+      "category": "bug-fix",
+      "project": "kanarix-app",
+      "severity": "important",
+      "content": "Hydration mismatch w React bierze się najczęściej z renderowania daty albo losowej wartości po stronie serwera i klienta. Ostrzeżenie w konsoli wskazuje komponent, ale przyczyna jest zwykle o poziom wyżej."
+    },
+    {
+      "key": "tailwind-purge-dynamic",
+      "category": "gotcha",
+      "project": "kanarix-app",
+      "severity": "info",
+      "content": "Tailwind wycina klasy budowane dynamicznie ze stringów, bo skaner widzi tylko literały. Klasę trzeba zapisać w całości albo dodać do safelisty."
+    },
+    {
+      "key": "gsc-index-coverage",
+      "category": "seo",
+      "project": "vs-beauty",
+      "severity": "important",
+      "content": "Search Console raportuje pokrycie indeksu z opóźnieniem kilku dni. Wnioskowanie o skutkach zmiany technicznej na podstawie raportu z tego samego tygodnia prowadzi do fałszywych wniosków w obie strony."
+    },
+    {
+      "key": "hreflang-pl-en",
+      "category": "i18n",
+      "project": "vs-beauty",
+      "severity": "important",
+      "content": "Hreflang musi być wzajemny: strona polska wskazuje angielską i odwrotnie. Jednostronna deklaracja jest ignorowana w całości, więc wygląda jakby wdrożenie nie zadziałało."
+    },
+    {
+      "key": "metric-measures-from-deploy",
+      "category": "gotcha",
+      "project": "claude-code-setup",
+      "severity": "critical",
+      "scope": "global",
+      "content": "Metryka wprowadzona dzisiaj nie opisuje wczoraj. Licznik wyświetleń dodany do istniejących wierszy sprawia, że każdy starszy wiersz ma zero z definicji, a liczba wygląda jak diagnoza zawartości. Okno pomiaru liczy się od pierwszego zarejestrowanego zdarzenia, nie od wieku wiersza."
+    },
+    {
+      "key": "mcp-restart-required",
+      "category": "tooling",
+      "project": "claude-code-setup",
+      "severity": "important",
+      "scope": "global",
+      "content": "Zmiana serwera MCP wymaga pełnego restartu sesji. Status Connected oznacza tylko, że proces wstał, a nie że narzędzia są w zestawie ani że klucz jest ważny. Hooki natomiast czytają źródło przy każdym uruchomieniu i aktualizują się od razu."
+    },
+    {
+      "key": "ssh-classifier-blocked",
+      "category": "tooling",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Komendy SSH bywają blokowane przez klasyfikator trybu automatycznego, nawet gdy plik reguł projektu wprost na nie zezwala. Agent nie może sam sobie nadać tego uprawnienia — trzeba poprosić właściciela o regułę uprawnień albo o uruchomienie komendy z prefiksem wykonania."
+    },
+    {
+      "key": "action-scheduler-context",
+      "category": "gotcha",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Kod domykający zamówienie leci w kontekście Action Schedulera albo crona, a nie w żądaniu admina. Wszystko, co jest ładowane tylko dla panelu, w tym kontekście po prostu nie istnieje."
+    },
+    {
+      "key": "firebase-cold-start",
+      "category": "performance",
+      "project": "kamar-bot",
+      "severity": "info",
+      "content": "Cold start funkcji Firebase potrafi dodać kilka sekund do pierwszego wywołania po okresie bezczynności. Przy integracji reagującej na webhook trzeba to wliczyć w timeout po stronie wysyłającego."
+    },
+    {
+      "key": "npm-rebuild-vs-install",
+      "category": "tooling",
+      "project": "brain-mcp",
+      "severity": "info",
+      "scope": "global",
+      "content": "Przy niezgodności ABI modułu natywnego npm rebuild kompiluje lokalnie przez gyp i bywa zawodny, a npm install potrafi pobrać gotowy prebuilt pod aktualną wersję node. Warto spróbować obu, zanim uzna się pakiet za niedziałający."
+    },
+    {
+      "key": "ollama-embeddings-dim",
+      "category": "tooling",
+      "project": "brain-mcp",
+      "severity": "info",
+      "content": "Wymiar wektora jest ustalany przy tworzeniu tabeli vec0 i nie da się go zmienić w miejscu. Zmiana modelu embeddingów wymaga przebudowy indeksu od zera, inaczej wyszukiwanie po prostu nic nie zwraca."
+    },
+    {
+      "key": "figma-colors-distractor",
+      "category": "design",
+      "project": "kanarix",
+      "severity": "info",
+      "content": "Paleta kolorów w Figmie ma być jednym źródłem prawdy, a tokeny w kodzie mają się z niej generować. Ręczne przepisywanie wartości hex rozjeżdża się w ciągu tygodni."
+    },
+    {
+      "key": "instagram-reels-distractor",
+      "category": "marketing",
+      "project": "vs-beauty",
+      "severity": "info",
+      "content": "Reels z twarzą w pierwszej sekundzie mają wyraźnie wyższe zatrzymanie niż plansza z tekstem. Materiał bez twarzy warto przycinać tak, żeby ruch zaczynał się natychmiast."
+    },
+    {
+      "key": "pricing-tiers-distractor",
+      "category": "business",
+      "project": "kanarix",
+      "severity": "info",
+      "content": "Trzy progi cenowe konwertują lepiej niż dwa, bo środkowy staje się punktem odniesienia. Najtańszy próg ma istnieć głównie po to, żeby środkowy wyglądał rozsądnie."
+    },
+    {
+      "key": "woo-checkout-hooks-order",
+      "category": "gotcha",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Hooki kasy WooCommerce odpalają się w kolejności priorytetów, a nie w kolejności rejestracji. Dwie wtyczki dopinające się do tego samego zdarzenia potrafią się nawzajem nadpisać w sposób zależny od kolejności ładowania."
+    }
+  ]
+}

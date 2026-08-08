@@ -11,8 +11,8 @@ import {
 } from "fs";
 import { join, dirname, sep, basename, isAbsolute, resolve } from "path";
 import { createHash } from "crypto";
-import { rrfFuse, type Embedder, type EmbeddingsConfig, type RankedList } from "./embeddings.js";
-import { planFtsQuery } from "./query.js";
+import type { Embedder, EmbeddingsConfig } from "./embeddings.js";
+import { searchLessons, severityBoosts } from "./search.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
@@ -281,31 +281,17 @@ export function scanProjects(db: Database.Database, codeDir: string): ProjectInf
 // Re-exported here because that is where callers and tests have always found it.
 export { sanitizeFTS5Query, planFtsQuery, tokenizeQuery } from "./query.js";
 
-// ── Ranking policy ──────────────────────────────────────────────────────────
-
-/**
- * How much each retriever's ranking counts in the fusion.
- *
- * Ordered by precision, and the gaps matter more than the absolute numbers.
- * `all` outweighs the rest combined at equal rank, so a lesson containing every
- * word of the question stays on top; `prefix` is deliberately weak because it is
- * there to rescue an inflected word, not to have opinions about relevance.
- */
-export const RETRIEVER_WEIGHTS = {
-  all: 3,
-  any: 1.5,
-  vector: 1.5,
-  prefix: 0.6,
-} as const;
-
-/** Multiplied into a fused score. A tie-breaker — see the note at the call site. */
-export const SEVERITY_BOOST: Record<string, number> = {
-  critical: 1.25,
-  important: 1.1,
-};
-
-/** Lessons filed as being about a tool rather than a project travel further. */
-export const SCOPE_GLOBAL_BOOST = 1.05;
+// Retrieval itself lives in ./search.ts — it returns rows, this file renders
+// them. Re-exported here because that is where callers and tests look.
+export {
+  searchLessons,
+  severityBoosts,
+  RETRIEVER_WEIGHTS,
+  SCOPE_GLOBAL_BOOST,
+  MAX_SEVERITY_BOOST,
+  type LessonRow,
+  type SearchOutcome,
+} from "./search.js";
 
 // ── Export/import helpers ───────────────────────────────────────────────────
 
@@ -488,163 +474,12 @@ export function createTools(
       project?: string;
       limit?: number;
     }): Promise<TextResult> => {
-      let results;
-      // id → which retriever(s) found it
-      let matchedBy: Map<number, string[]> | null = null;
-      let modeNote = "";
-      let searchedTerms: string[] = [];
-
-      if (query.trim()) {
-        const max = limit || 10;
-        // Over-fetch every retriever so reciprocal rank fusion has depth to work with.
-        const fetchN = Math.min(100, max * 5);
-
-        // The plan is three queries over one set of terms: every term (precise),
-        // any term (recall), any stem (morphology). Running only the first is
-        // what made an ordinary sentence return nothing — see src/query.ts.
-        const plan = planFtsQuery(query);
-        searchedTerms = plan.terms;
-
-        const rowById = new Map<number, Record<string, unknown>>();
-        const lists: RankedList[] = [];
-
-        /**
-         * Run one MATCH and remember the rows it found, best-first.
-         *
-         * A malformed query must not surface as a SQLite error message: the
-         * caller asked a question, not for a parser diagnostic, and the other
-         * retrievers may still answer it. Every term is quoted upstream, so this
-         * should be unreachable — it is here because "should be" is how the old
-         * code came to throw `fts5: syntax error near "fix"` at anyone who typed
-         * a question mark.
-         */
-        const addRetriever = (retriever: string, weight: number, match: string | null): void => {
-          if (!match) return;
-          let sql = `
-            SELECT l.id, l.content, l.category, l.tags, l.project, l.source,
-                   l.severity, l.scope, l.created_at
-            FROM lessons_fts fts
-            JOIN lessons l ON l.id = fts.rowid
-            WHERE lessons_fts MATCH ?
-          `;
-          const params: (string | number)[] = [match];
-
-          if (category) {
-            sql += ` AND l.category = ?`;
-            params.push(category);
-          }
-          if (project) {
-            sql += ` AND (l.project = ? OR l.tags LIKE ?)`;
-            params.push(project);
-            params.push(`%"${project}"%`);
-          }
-
-          sql += ` ORDER BY bm25(lessons_fts) LIMIT ?`;
-          params.push(fetchN);
-
-          let rows: Record<string, unknown>[];
-          try {
-            rows = db.prepare(sql).all(...params) as Record<string, unknown>[];
-          } catch (err) {
-            console.error(
-              `⚠️ brain-mcp: retriever '${retriever}' failed (${err instanceof Error ? err.message : String(err)}) — skipped.`
-            );
-            return;
-          }
-
-          for (const row of rows) {
-            const id = Number(row.id);
-            if (!rowById.has(id)) rowById.set(id, row);
-          }
-          lists.push({ retriever, weight, ids: rows.map((r) => Number(r.id)) });
-        };
-
-        addRetriever("all", RETRIEVER_WEIGHTS.all, plan.all);
-        addRetriever("any", RETRIEVER_WEIGHTS.any, plan.any);
-        addRetriever("prefix", RETRIEVER_WEIGHTS.prefix, plan.prefix);
-
-        if (hybridEnabled) {
-          // Vector search joins as one more opinion. Any embedding failure
-          // (Ollama down, model missing, dimension mismatch) simply leaves the
-          // lexical retrievers to answer alone.
-          try {
-            const queryVec = await embedder!(query);
-            const knnHits = vector!.knn(queryVec, fetchN * 2);
-
-            const getRow = db.prepare(
-              "SELECT id, content, category, tags, project, source, severity, scope, created_at FROM lessons WHERE id = ?"
-            );
-            const vecIds: number[] = [];
-            for (const hit of knnHits) {
-              let row = rowById.get(hit.id);
-              if (!row) {
-                row = getRow.get(hit.id) as Record<string, unknown> | undefined;
-                if (!row) continue; // stale vector for a deleted lesson
-                rowById.set(hit.id, row);
-              }
-              // Apply the same filters the lexical retrievers used.
-              if (category && row.category !== category) continue;
-              if (
-                project &&
-                row.project !== project &&
-                !String(row.tags ?? "").includes(`"${project}"`)
-              ) continue;
-              vecIds.push(hit.id);
-              if (vecIds.length >= fetchN) break;
-            }
-
-            lists.push({ retriever: "vector", weight: RETRIEVER_WEIGHTS.vector, ids: vecIds });
-            modeNote = " (hybrid: lexical + vector, RRF-fused)";
-          } catch (err) {
-            console.error(
-              `⚠️ brain-mcp: hybrid recall degraded to lexical-only (${err instanceof Error ? err.message : String(err)})`
-            );
-          }
-        }
-
-        // SEVERITY AND SCOPE ARE TIE-BREAKERS, NOT RANKINGS.
-        // They nudge a fused score by a few percent, which decides between two
-        // lessons the retrievers found equally relevant and can never promote an
-        // unrelated one. The same asymmetry the prompt hook uses, and for the
-        // same reason: a `critical` lesson nobody reads is a lesson that failed.
-        const boosted = rrfFuse(lists).map((hit) => {
-          const row = rowById.get(hit.id);
-          const severity = String(row?.severity ?? "");
-          const scope = String(row?.scope ?? "project");
-          let score = hit.score;
-          score *= SEVERITY_BOOST[severity] ?? 1;
-          if (scope === "global") score *= SCOPE_GLOBAL_BOOST;
-          return { ...hit, score };
-        });
-        boosted.sort(
-          (a, b) =>
-            b.score - a.score ||
-            b.retrievers.length - a.retrievers.length ||
-            a.id - b.id
+      const { rows: results, matchedBy, terms: searchedTerms, modeNote } =
+        await searchLessons(
+          db,
+          { query, category, project, limit },
+          { vector, embedder, severityBoost: severityBoosts(db) }
         );
-
-        const top = boosted.slice(0, max);
-        results = top.map((h) => rowById.get(h.id)).filter(Boolean) as Record<string, unknown>[];
-        matchedBy = new Map(top.map((h) => [h.id, h.retrievers]));
-      } else {
-        let sql = `SELECT * FROM lessons WHERE 1=1`;
-        const params: (string | number)[] = [];
-
-        if (category) {
-          sql += ` AND category = ?`;
-          params.push(category);
-        }
-        if (project) {
-          sql += ` AND (project = ? OR tags LIKE ?)`;
-          params.push(project);
-          params.push(`%"${project}"%`);
-        }
-
-        sql += ` ORDER BY created_at DESC LIMIT ?`;
-        params.push(limit || 10);
-
-        results = db.prepare(sql).all(...params);
-      }
 
       if (!results.length) {
         // A BARE "NOT FOUND" IS WHAT TAUGHT CALLERS THE BASE WAS EMPTY.

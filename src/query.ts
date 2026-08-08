@@ -101,17 +101,34 @@ export function tokenizeQuery(text: string): string[] {
   );
 }
 
+/** Terms this long or longer are cut down to STEM_CAP characters. */
+export const STEM_MIN_LEN = 6;
+
+/** How much of a long term survives stemming. */
+export const STEM_CAP = 5;
+
 /**
  * The prefix a term is searched by when exact matching is too strict.
  *
- * Polish inflects the end of the word — zamówień / zamówienia / zamówieniu are
- * one concept and three tokens — and English suffixes (backfill / backfilling)
- * behave the same way. Trimming two characters off anything long enough to
- * survive it covers both without a stemmer and without a language guess. Short
- * terms are left alone: "eval" trimmed to "ev" would match half the base.
+ * Polish inflects the end of the word — zamówień / zamówienia / zamówieniach
+ * are one concept and three tokens — and English suffixes behave the same way.
+ *
+ * A FIXED CAP, NOT A FIXED TRIM. Trimming a couple of characters is the obvious
+ * design and it does not work, because the endings differ in length: the query
+ * `zamówieniach` trimmed by two is `zamówienia`, which still does not match a
+ * lesson that says `zamówień`. Two inflections only meet at the stem they
+ * share, and `kosztach`/`koszty` share just five characters. So anything long
+ * enough to be inflected is cut to that shared root, in both directions —
+ * asymmetric stemming would find a lesson from a question but not the reverse.
+ *
+ * This is aggressive on purpose, and affordable because of where it sits: the
+ * prefix retriever carries the lowest weight in the fusion (see
+ * RETRIEVER_WEIGHTS), so it rescues an inflected word without being able to
+ * outrank an exact match. tests/eval.test.ts is what holds that claim to
+ * account — precision@1 and the true-negative rate are measured, not assumed.
  */
 export function stemForPrefix(token: string): string {
-  return token.length >= 7 ? token.slice(0, token.length - 2) : token;
+  return token.length >= STEM_MIN_LEN ? token.slice(0, STEM_CAP) : token;
 }
 
 /**

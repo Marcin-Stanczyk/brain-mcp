@@ -1,0 +1,160 @@
+{
+  "_readme": [
+    "Judged queries against tests/eval/corpus.json. `relevant` lists corpus keys a",
+    "reader would call a hit; an empty list is a query that must return NOTHING, and",
+    "those are as load-bearing as the positive ones — a retriever that answers every",
+    "question with something is a retriever nobody can trust.",
+    "",
+    "Questions are written the way people actually ask them: whole sentences, mixed",
+    "Polish and English, inflected nouns, punctuation. The bug this suite exists to",
+    "prevent was invisible precisely because the old tests searched with keywords",
+    "that all appeared in one lesson.",
+    "",
+    "`requiresSemantic: true` marks a query lexical retrieval provably cannot answer:",
+    "the question and the lesson share meaning but no words — usually because one is",
+    "in English and the other in Polish. They are scored separately rather than",
+    "quietly dropped, so the cost of running without embeddings is a number in the",
+    "report instead of an opinion in a README."
+  ],
+  "queries": [
+    {
+      "query": "wp eval koszty zamówień backfill lipiec",
+      "relevant": [
+        "wp-eval-production",
+        "koszty-zamowien-woo",
+        "backfill-partiami"
+      ],
+      "why": "The reported failure. No single lesson holds every term; implicit AND returned nothing."
+    },
+    {
+      "query": "dlaczego mój skrypt bashowy kończy się kodem 141 bez żadnego komunikatu?",
+      "relevant": [
+        "bash-pipefail-head"
+      ],
+      "why": "Punctuation and a full sentence; also a global lesson filed under another project."
+    },
+    {
+      "query": "zniknęła mi niezacommitowana poprawka po teście mutacyjnym",
+      "relevant": [
+        "git-checkout-mutation"
+      ]
+    },
+    {
+      "query": "deploy padł przy pushu do chronionej gałęzi",
+      "relevant": [
+        "protected-branch-deploy"
+      ]
+    },
+    {
+      "query": "why does recall return nothing when the lessons clearly exist?",
+      "relevant": [
+        "fts5-implicit-and"
+      ],
+      "why": "English question, Polish lesson, no shared vocabulary at all. Only embeddings can bridge this — it is the measured case for turning them on.",
+      "requiresSemantic": true
+    },
+    {
+      "query": "NODE_MODULE_VERSION mismatch przy starcie serwera MCP",
+      "relevant": [
+        "native-module-abi",
+        "npm-rebuild-vs-install"
+      ],
+      "requiresSemantic": true,
+      "why": "native-module-abi is found lexically; npm-rebuild-vs-install shares meaning but almost no words with the question."
+    },
+    {
+      "query": "czy koszt dostawcy jest netto czy brutto?",
+      "relevant": [
+        "woo-price-includes-tax",
+        "finance-margin-long"
+      ]
+    },
+    {
+      "query": "jak liczona jest marża w module finanse i skąd bierze się różnica",
+      "relevant": [
+        "finance-margin-long",
+        "woo-price-includes-tax"
+      ],
+      "why": "The long lesson: 3k+ characters, which bm25 length normalisation penalises."
+    },
+    {
+      "query": "faktura nie powinna się generować dla zamówień za pobraniem",
+      "relevant": [
+        "infakt-cod-skip"
+      ]
+    },
+    {
+      "query": "zamówienie zostało w pending mimo że blik przeszedł",
+      "relevant": [
+        "payu-blik-timeout"
+      ]
+    },
+    {
+      "query": "dwie wtyczki nadpisują się w kasie",
+      "relevant": [
+        "woo-checkout-hooks-order"
+      ]
+    },
+    {
+      "query": "czy muszę restartować sesję po zmianie konfiguracji mcp?",
+      "relevant": [
+        "mcp-restart-required"
+      ]
+    },
+    {
+      "query": "licznik wyświetleń pokazuje zero dla wszystkich starszych wierszy",
+      "relevant": [
+        "metric-measures-from-deploy"
+      ]
+    },
+    {
+      "query": "zmieniłem model embeddingów i wyszukiwanie przestało cokolwiek zwracać",
+      "relevant": [
+        "ollama-embeddings-dim"
+      ]
+    },
+    {
+      "query": "stary html wisi po wdrożeniu mimo poprawnego kodu",
+      "relevant": [
+        "hetzner-litespeed-cache"
+      ]
+    },
+    {
+      "query": "hreflang między wersją polską a angielską nie działa",
+      "relevant": [
+        "hreflang-pl-en"
+      ]
+    },
+    {
+      "query": "co wiemy o kosztach zamówieniach w sklepie",
+      "relevant": [
+        "koszty-zamowien-woo"
+      ],
+      "why": "Inflected: the lesson says 'Koszty zamówień', the question says 'kosztach zamówieniach'. Only the prefix retriever bridges this."
+    },
+    {
+      "query": "pułapka z pipefail przy potoku",
+      "project": "kamar",
+      "relevant": [
+        "bash-pipefail-head"
+      ],
+      "why": "Filtered to kamar, but the lesson is filed under claude-code-setup with scope=global. It must cross the project filter — that is what scope is for."
+    },
+    {
+      "query": "równoległe zapisy do sqlite z kilku procesów",
+      "relevant": [
+        "sqlite-wal-busy-timeout"
+      ]
+    },
+    {
+      "query": "kubernetes istio service mesh sidecar injection",
+      "relevant": [],
+      "why": "Nothing in the base is about this. Returning something here would be worse than silence."
+    },
+    {
+      "query": "roadmap obliczeń kwantowych na przyszły kwartał",
+      "relevant": [],
+      "why": "Polish negative — the stemmer is aggressive, so this checks it does not manufacture matches."
+    }
+  ]
+}

@@ -129,17 +129,18 @@ def fts_query(text, max_terms=24):
 def fts_prefix_query(text, max_terms=24):
     """An OR-query over stems, or "" when no term is long enough to stem.
 
-    Polish inflects the end of a word: a lesson written about `zamówienia` is
+    Polish inflects the end of a word: a lesson written about `zamówień` is
     invisible to a prompt that says `zamówieniach`, and both are the same thing.
-    Trimming two characters off anything long enough to survive it covers that
-    without a stemmer and without guessing the language. Mirrors `stemForPrefix`
-    in src/query.ts.
+    Two inflections only meet at the stem they share, and that stem is short —
+    `kosztach` and `koszty` have five characters in common — so a long term is
+    cut to a fixed cap rather than trimmed by a fixed amount. Mirrors
+    `stemForPrefix` in src/query.ts; the TypeScript tests assert the two agree.
 
-    Returns "" when nothing was trimmed — an identical query run twice is just
+    Returns "" when nothing was cut — an identical query run twice is just
     noise in the ranking.
     """
     terms = fts_terms(text, max_terms)
-    stems = [w[:-2] if len(w) >= 7 else w for w in terms]
+    stems = [w[:5] if len(w) >= 6 else w for w in terms]
     if stems == terms:
         return ""
     return " OR ".join(f'"{s}"*' for s in stems)

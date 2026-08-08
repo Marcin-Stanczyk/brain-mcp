@@ -166,12 +166,14 @@ class TestBrainDB(unittest.TestCase):
             self.bd.fts_terms("zamówień łódź ćwiczenia"),
         )
 
-    def test_prefix_query_stems_long_terms_only(self):
-        # `zamówieniach` in a prompt and `zamówienia` in a lesson are one word to
-        # a reader and two to FTS5. Trimming the inflected tail bridges them.
-        q = self.bd.fts_prefix_query("zamówieniach koszty")
-        self.assertIn('"zamówienia"*', q)
-        self.assertIn('"koszty"*', q, "a six-letter term is left whole")
+    def test_prefix_query_cuts_to_the_shared_root(self):
+        # `zamówieniach` in a prompt and `zamówień` in a lesson are one word to a
+        # reader and two to FTS5. They meet only at the root they share, and it
+        # is short — trimming a fixed couple of characters lands between them and
+        # matches neither.
+        self.assertEqual('"zamów"* OR "koszt"*', self.bd.fts_prefix_query("zamówieniach kosztach"))
+        self.assertEqual('"zamów"* OR "koszt"*', self.bd.fts_prefix_query("zamówień koszty"),
+                         "both directions land on the same root")
 
     def test_prefix_query_empty_when_nothing_was_stemmed(self):
         # Identical to the exact query, so running it would only add noise.
