@@ -453,6 +453,48 @@ class TestIncidentWatch(HookCase):
     def test_survives_an_empty_payload(self):
         self.assertEqual(0, self.run_hook("incident_watch.py", {}).returncode)
 
+    def test_making_a_backup_is_not_restoring_one(self):
+        # THE FALSE POSITIVE THIS HOOK KEEPS COMMITTING, now with a test.
+        # Taking a backup before a risky change is the most careful thing anybody
+        # does; being scolded for it is precisely how a hook earns being turned
+        # off. Two regex attempts got this wrong in the same direction before the
+        # check became positional.
+        from incident_watch import restored_from_backup as restored
+        for cmd in [
+            "cp ~/.claude/settings.json /tmp/settings.json.bak-$(date +%s) && ls -la /tmp/*.bak-*",
+            "cp config.json config.json.bak",
+            "cp -a site/ site.backup/",
+            "mv schema.sql schema.sql.orig",
+            "ls -la /tmp/x.bak",
+            "echo 'restore from backup'",
+        ]:
+            self.assertFalse(restored(cmd), f"reported as an undo: {cmd}")
+
+    def test_restoring_a_backup_is_an_undo(self):
+        from incident_watch import restored_from_backup as restored
+        for cmd in [
+            "cp /tmp/settings.json.bak-123 ~/.claude/settings.json",
+            "mv app.py.orig app.py",
+            "rsync -a site.backup/ site/",
+            "sudo cp /etc/nginx.conf.bak /etc/nginx.conf",
+            "make build && cp db.sql.backup db.sql",
+        ]:
+            self.assertTrue(restored(cmd), f"missed a real restore: {cmd}")
+
+    def test_end_to_end_a_backup_does_not_prompt(self):
+        proc = self.run_hook("incident_watch.py", {
+            "session_id": "s", "cwd": "/code/kamar", "tool_name": "Bash",
+            "tool_input": {"command": "cp ~/.claude/settings.json /tmp/settings.json.bak-$(date +%s)"},
+            "tool_response": {"stdout": "", "exit_code": 0}})
+        self.assertEqual("", proc.stdout.strip(), "taking a backup was reported as an undo")
+
+    def test_end_to_end_a_restore_does_prompt(self):
+        proc = self.run_hook("incident_watch.py", {
+            "session_id": "s", "cwd": "/code/kamar", "tool_name": "Bash",
+            "tool_input": {"command": "cp /tmp/settings.json.bak-1 ~/.claude/settings.json"},
+            "tool_response": {"stdout": "", "exit_code": 0}})
+        self.assertIn("undo just ran", proc.stdout)
+
     def test_ignores_an_ordinary_command(self):
         proc = self.run_hook("incident_watch.py", {
             "session_id": "s", "cwd": "/code/kamar",

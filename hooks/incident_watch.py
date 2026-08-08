@@ -45,14 +45,10 @@ REVERT_PATTERNS = [
     ("git-clean", r"\bgit\s+clean\s+-[a-z]*f", "deleted untracked files"),
     ("git-stash-drop", r"\bgit\s+stash\s+(drop|clear)\b", "discarded stashed work"),
     ("git-amend", r"\bgit\s+commit\b.*--amend", "rewrote a commit that was wrong"),
-    # Only a backup used as SOURCE is an undo. The naive version matched the
-    # destination too, so `cp config.json config.json.bak` — creating a backup,
-    # the most cautious thing anyone does — was reported as a revert. It fired
-    # twice in one session on deliberate pre-change backups; two false alarms is
-    # how a hook earns being switched off.
-    ("restore-backup",
-     r"\b(cp|mv|rsync)\b[^\n]*\S\.(bak|backup|orig)\b(?![\w./-]*\s*$)",
-     "restored from a backup"),
+    # Only a backup used as SOURCE is an undo. See restored_from_backup below —
+    # this one is a function rather than a regex, because two regex attempts at it
+    # both produced false alarms on the most cautious thing anybody does.
+    ("restore-backup", None, "restored from a backup"),
     ("rebase-abort", r"\bgit\s+rebase\s+--abort\b", "abandoned a rebase"),
 ]
 
@@ -65,6 +61,47 @@ MAX_CMD_CHARS = 400
 # docstring, a generated file) then reads as a revert. Observed three times in
 # one session, including on this file's own tests.
 _HEREDOC = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?")
+
+# WHETHER A BACKUP WAS RESTORED, OR MERELY MADE.
+# ---------------------------------------------------------------------------
+# Twice now this has been answered with a regex and twice it has been wrong, in
+# the same direction: reporting the creation of a backup as an undo. That is the
+# worst possible false positive for this hook — taking a backup before a risky
+# change is the most careful thing anyone does, and being scolded for it is
+# exactly how a hook earns being switched off.
+#
+#   attempt 1  matched a .bak anywhere            -> `cp conf.json conf.json.bak`
+#   attempt 2  excluded a .bak at END of command  -> `cp conf.json conf.bak-$(date +%s) && ls`
+#
+# The second failed because "is it last?" is a proxy for the real question, and
+# the proxy breaks the moment anything follows: a `&&`, a redirect, a timestamp
+# suffix. The real question is positional — is the backup a SOURCE or the
+# DESTINATION? — so ask that instead.
+_BACKUP_SUFFIX = re.compile(r"\.(bak|backup|orig)\b")
+_SUBST = re.compile(r"\$\([^)]*\)|`[^`]*`")
+_SEGMENT = re.compile(r"&&|\|\||[;|&\n]")
+_ASSIGN = re.compile(r"^\w+=")
+_COPIERS = ("cp", "mv", "rsync", "install")
+
+
+def restored_from_backup(cmd: str) -> bool:
+    """True only when a .bak/.backup/.orig path is a SOURCE of a copy."""
+    # Command substitutions go first: `$(date +%s)` splits into tokens that
+    # shift every argument along and turn the destination into a "source".
+    cleaned = _SUBST.sub("", cmd)
+    for segment in _SEGMENT.split(cleaned):
+        tokens = segment.split()
+        i = 0
+        while i < len(tokens) and (_ASSIGN.match(tokens[i]) or tokens[i] in ("sudo", "command", "env")):
+            i += 1
+        if i >= len(tokens) or os.path.basename(tokens[i]) not in _COPIERS:
+            continue
+        operands = [t for t in tokens[i + 1:] if not t.startswith("-")]
+        if len(operands) < 2:
+            continue
+        if any(_BACKUP_SUFFIX.search(o) for o in operands[:-1]):
+            return True
+    return False
 
 
 def strip_heredocs(cmd: str) -> str:
@@ -171,7 +208,8 @@ def main():
     # --- signal 1: an undo ran (prompt immediately) ---
     scan = strip_heredocs(cmd)
     for label, pattern, meaning in REVERT_PATTERNS:
-        if re.search(pattern, scan):
+        hit = restored_from_backup(scan) if pattern is None else re.search(pattern, scan)
+        if hit:
             append(sid, {"kind": "revert", "label": label, "cmd": cmd,
                          "meaning": meaning})
             print(json.dumps({
