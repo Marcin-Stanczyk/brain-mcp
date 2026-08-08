@@ -21,12 +21,16 @@ import json
 import os
 import sqlite3
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _brain_db  # noqa: E402
+import sys
 import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.environ.get("BRAIN_DB") or os.path.join(_REPO, "data", "knowledge.db")
 
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
+STATE_DIR = _brain_db.STATE_DIR   # one definition, in _brain_db
 MIN_SECONDS = int(os.environ.get("BRAIN_HOOK_MIN_SECONDS", "180"))
 
 GENERIC_PROMPT = (

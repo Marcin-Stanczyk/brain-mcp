@@ -8,7 +8,8 @@
  *   node scripts/install-hooks.mjs --dry-run
  *
  * What it does:
- *   SessionStart -> hooks/session_context.py   inject this project's lessons
+ *   SessionStart    -> hooks/session_context.py   inject this project's lessons
+ *   UserPromptSubmit -> hooks/relevant_lessons.py  inject lessons matching the task
  *   Stop         -> hooks/capture_lesson.py    ask for a lesson if none written
  *
  * Design notes:
@@ -30,6 +31,11 @@ const HOOKS_DIR = join(REPO, 'hooks');
 
 const HOOKS = [
   { event: 'SessionStart', file: 'session_context.py', timeout: 10 },
+  // The one that makes stored lessons actually arrive. SessionStart runs before
+  // anybody knows what the session is about, so its twelve slots are spent on a
+  // guess; this runs once the task has been stated and searches for lessons that
+  // match it, across every project rather than only the open one.
+  { event: 'UserPromptSubmit', file: 'relevant_lessons.py', timeout: 5 },
   { event: 'Stop', file: 'capture_lesson.py', timeout: 10 },
   // Catch mistakes as they happen, not at session end. Scoped to Bash: the
   // signals are shell-level (an undo command ran, a command kept failing).

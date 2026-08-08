@@ -25,6 +25,10 @@ import json
 import os
 import re
 import sqlite3
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _brain_db  # noqa: E402
 import subprocess
 import sys
 import time
@@ -44,7 +48,7 @@ GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
     "BRAIN_HOOK_GLOBAL_PROJECTS", "").split(",") if p.strip()]
 MAX_GLOBAL_CRITICALS = int(os.environ.get("BRAIN_HOOK_MAX_GLOBAL", "4"))
 SNIPPET_CHARS = 220
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
+STATE_DIR = _brain_db.STATE_DIR   # one definition, in _brain_db
 
 
 def project_name(cwd: str) -> str:

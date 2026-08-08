@@ -99,8 +99,48 @@ The database is created automatically on first run (default: `data/knowledge.db`
 | Hook | Script | Effect |
 |------|--------|--------|
 | `SessionStart` | `hooks/session_context.py` | Reads the database directly and injects this project's lessons — criticals first — before the first token. Also injects `critical` lessons from `BRAIN_HOOK_GLOBAL_PROJECTS` regardless of directory, and flags when a [graphify](https://github.com/Graphify-Labs/graphify) code graph exists so the agent queries the graph instead of grepping — but only after verifying the graph is current, by comparing every indexed file's mtime against the graph's. A stale index is worse than none: this hook is what tells the agent to trust it over grep, so it is also what has to withdraw that advice. |
+| `UserPromptSubmit` | `hooks/relevant_lessons.py` | Searches the FTS5 index for lessons that match **what you just asked**, across every project, and injects the top three in full. This is the hook that makes stored knowledge arrive at the moment it can change a decision — see [Why relevance, and why not at session start](#why-relevance-and-why-not-at-session-start). Stays silent when nothing matches, never repeats a lesson within a session, and records that a lesson was shown. |
 | `PostToolUse` / `PostToolUseFailure` | `hooks/incident_watch.py` | Watches Bash for the moment a mistake becomes visible: an undo command (`git checkout --`, `restore`, `reset --hard`, `revert`, `clean`, `stash drop`, `commit --amend`, restoring a `.bak`) or the same command failing repeatedly. Undos prompt for a lesson **immediately**, while the cause is still known; repeat failures are logged silently. |
 | `Stop` | `hooks/capture_lesson.py` | If the session wrote nothing, asks **once** for a lesson — naming the specific incidents `incident_watch` recorded, rather than asking "did you learn anything". |
+
+### Why relevance, and why not at session start
+
+`SessionStart` runs before anybody knows what the session is about. The best it
+can do is guess, and for a long time the guess was: the twelve most recent
+lessons of the open project, severity first, truncated to 220 characters each.
+Measured against 297 stored lessons in August 2026, that guess meant:
+
+| | |
+|---|---|
+| Lessons that could ever be seen outside their own project | **6 of 297** (2%) |
+| Lessons a session in the largest project could see | **12 of 124** |
+| `critical` lessons in that project | 60 — so the twelve slots never reached `important` or `info` at all |
+| Ranking | severity, then `updated_at DESC`. Recency. Never relevance. |
+| Recorded uses | none — nothing in the schema said a lesson had ever been read |
+
+Writing was enforced by a **blocking** `Stop` hook; reading was one preview at
+the start and nothing afterwards. The system was very good at capturing lessons
+and close to inert at recalling them.
+
+No amount of tuning `SessionStart` fixes that, because the problem is timing.
+`UserPromptSubmit` is the first moment the task is known, so that is where the
+search belongs — and the search itself already existed: `brain_recall` does it
+well, it was simply left to the model's discretion, and a model does not know
+what it does not know.
+
+Two consequences worth stating plainly:
+
+- **The current project wins ties, it does not win outright.** A lesson about a
+  bash trap learned in one repository is precisely the lesson that prevents the
+  same mistake in another, and project-scoped recall is what made it invisible.
+- **Silence is a feature.** The hook stays quiet unless something genuinely
+  matches. A memory system that answers every prompt with three vaguely related
+  paragraphs teaches people to skim past the block that will one day matter.
+
+Lessons now carry `shown_count` and `last_shown_at`, so "is any of this being
+used?" is a query rather than an impression. Nothing writes `updated_at` when
+they change — showing a lesson must not make it look freshly written, or it
+would float to the top of the recency-ordered session digest and stay there.
 
 ### Why capture at the moment, not at the end
 
@@ -120,7 +160,7 @@ catch it earlier, not just a description of the symptom.
 
 Hooks cannot call MCP tools — a hook is a separate process, MCP is JSON-RPC inside the agent's session. So `SessionStart` opens the SQLite file read-only. That is also cheaper than a tool call: zero model round-trips, and the knowledge is simply present from the start.
 
-Both hooks **fail open**. Any error exits 0 with no output, so a broken hook can never stop a session from starting or trap one in a loop. The `Stop` hook additionally guards against loops four ways: it respects `stop_hook_active`, blocks at most once per session (tracked by a per-session marker), stays quiet for sessions under `BRAIN_HOOK_MIN_SECONDS`, and never asks when the lesson count already grew.
+All four hooks **fail open**. Any error exits 0 with no output, so a broken hook can never stop a session from starting or trap one in a loop. The `Stop` hook additionally guards against loops four ways: it respects `stop_hook_active`, blocks at most once per session (tracked by a per-session marker), stays quiet for sessions under `BRAIN_HOOK_MIN_SECONDS`, and never asks when the lesson count already grew.
 
 ### Cross-cutting lessons
 
@@ -477,6 +517,28 @@ npm run build
 rm data/knowledge.db
 # The database is recreated on the next server start
 ```
+
+### Tests
+
+```bash
+npm test           # the MCP server (39 tests)
+npm run test:hooks # the hooks (41 tests, standard library only)
+npm run test:all   # both
+```
+
+The hooks are tested separately and in Python, because that is what they are:
+plain scripts with no dependencies, so the suite needs nothing beyond the
+interpreter that runs them. They had no tests at all until August 2026 while
+`src/` had 39 — and they are the only mechanism by which anything stored here
+ever reaches an agent.
+
+A hook is a pure function of (stdin payload, database, cwd) → (stdout, exit
+code). The suite covers the search and ranking, the per-session
+no-repeat rule, the instrumentation (including that showing a lesson must not
+touch `updated_at`), the `Stop` hook's four anti-loop guards, and — for every
+hook — malformed JSON, an empty payload, a missing database, a corrupt database,
+a read-only database and an unwritable state directory. **No hook may ever be
+the reason a session fails.**
 
 ### Smoke test
 
