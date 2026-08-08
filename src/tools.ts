@@ -400,7 +400,16 @@ export function createTools(
       tags: z.array(z.string().max(100)).max(50).optional().describe("Tags for searchability"),
       project: z.string().max(200).optional().describe("Which project this relates to"),
       source: z.string().max(500).optional().describe("Where this was learned (file, URL, conversation)"),
-      severity: z.enum(["critical", "important", "info", "tip"]).optional().default("info"),
+      severity: z.enum(["critical", "important", "info", "tip"]).optional().default("info").describe(
+        "How much it costs to NOT know this, not how hard it was to find out. " +
+        "'critical' = ignoring it loses data, money, or production; " +
+        "'important' = ignoring it costs a rebuild or an hour of confusion; " +
+        "'info' = worth knowing, costs nothing to miss; 'tip' = a convenience. " +
+        "Default to 'info'. The field had no description for months and 90% of the " +
+        "base ended up critical or important, at which point it ordered nothing — " +
+        "the ranking boost is derived from how rare a label is, so inflating it " +
+        "does not promote your lesson, it demotes everyone else's."
+      ),
       scope: z.enum(["project", "global"]).optional().default("project").describe(
         "'global' for a lesson about a TOOL rather than a project — a shell trap, a git " +
         "behaviour, an API limit. Those recur everywhere, and filing them under whichever " +
@@ -734,6 +743,37 @@ export function createTools(
       output += `\n`;
 
       // Embeddings / vector search status
+      // SEVERITY, AND HOW MUCH OF IT IS LEFT.
+      // `critical` is a ranking input, and an input is only worth what it
+      // excludes. Measured on the live base on 2026-08-08: 118 critical and 155
+      // important out of 303 — 90% of everything carried a raised severity, so
+      // the label separated nothing and the boost rewarded almost the whole
+      // base. The boost is derived from these shares now (see severityBoosts),
+      // which means it decays on its own; printing the shares is what makes that
+      // decay visible instead of merely automatic.
+      const bySeverity = db.prepare(
+        "SELECT COALESCE(severity, 'info') AS severity, COUNT(*) AS count FROM lessons GROUP BY 1 ORDER BY 2 DESC"
+      ).all() as { severity: string; count: number }[];
+      if (lessons.count) {
+        const boosts = severityBoosts(db);
+        output += `### Severity\n`;
+        for (const row of bySeverity) {
+          const share = row.count / lessons.count;
+          const boost = boosts[row.severity];
+          output += `• ${row.severity}: ${row.count} (${Math.round(share * 100)}%)` +
+            (boost ? ` → ranking boost ×${boost.toFixed(2)}\n` : `\n`);
+        }
+        const raised = bySeverity
+          .filter((r) => r.severity === "critical" || r.severity === "important")
+          .reduce((n, r) => n + r.count, 0) / lessons.count;
+        if (raised > 0.75) {
+          output += `\n⚠️ ${Math.round(raised * 100)}% of lessons are critical or important. ` +
+            `Severity that almost every lesson claims cannot order anything, so its ` +
+            `influence on ranking has shrunk accordingly. Reserve the labels or stop reading them.\n`;
+        }
+        output += `\n`;
+      }
+
       output += `### Embeddings\n`;
       if (!embeddingsConfig) {
         // SAY WHAT IS RUNNING, NOT ONLY WHAT IS OFF.
