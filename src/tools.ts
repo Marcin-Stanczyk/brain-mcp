@@ -726,6 +726,57 @@ export function createTools(
       output += `| Patterns | ${patterns.count} |\n`;
       output += `| Projects indexed | ${projects.count} |\n\n`;
 
+      // RETRIEVAL — is any of this actually reaching an agent?
+      // For a long time the honest answer was "nobody can tell", and that was a
+      // property of the schema rather than of the lessons. It is a query now, so
+      // it belongs in the one place somebody looks at the state of the base.
+      const shown = db.prepare(
+        "SELECT COUNT(*) as count FROM lessons WHERE COALESCE(shown_count, 0) > 0"
+      ).get() as { count: number };
+      const globals = db.prepare(
+        "SELECT COUNT(*) as count FROM lessons WHERE scope = 'global'"
+      ).get() as { count: number };
+      // Old and never retrieved is the closest thing to a measure of dead
+      // weight: written under the Stop hook's pressure, never once relevant.
+      const staleUnused = db.prepare(
+        "SELECT COUNT(*) as count FROM lessons " +
+        "WHERE COALESCE(shown_count, 0) = 0 AND created_at < datetime('now', '-30 days')"
+      ).get() as { count: number };
+      const topShown = db.prepare(
+        "SELECT id, shown_count, substr(replace(content, char(10), ' '), 1, 60) AS preview " +
+        "FROM lessons WHERE COALESCE(shown_count, 0) > 0 ORDER BY shown_count DESC, id DESC LIMIT 5"
+      ).all() as { id: number; shown_count: number; preview: string }[];
+
+      output += `### Retrieval\n`;
+      output += `Lessons ever surfaced: ${shown.count} of ${lessons.count}`;
+      output += lessons.count ? ` (${Math.round((shown.count / lessons.count) * 100)}%)\n` : `\n`;
+      output += `Marked \`global\` (about a tool, not a project): ${globals.count}\n`;
+      // A LESSON CANNOT BE COUNTED BEFORE COUNTING BEGAN.
+      // Reported naively, "never surfaced" is true of the entire base on the day
+      // the instrumentation lands, and reads like a finding about the lessons
+      // when it is a fact about the clock. So the window is measured from the
+      // first recorded retrieval, and until it is wide enough the number is
+      // withheld rather than dressed up with a footnote nobody reads.
+      const firstShow = db.prepare(
+        "SELECT MIN(last_shown_at) AS since FROM lessons WHERE last_shown_at IS NOT NULL"
+      ).get() as { since: string | null };
+      const windowDays = firstShow.since
+        ? Math.floor((Date.now() - Date.parse(firstShow.since + "Z")) / 86_400_000)
+        : 0;
+      if (!firstShow.since) {
+        output += `No retrieval recorded yet — nothing has been surfaced since counting began.\n`;
+      } else if (windowDays < 30) {
+        output += `Counting began ${windowDays} day(s) ago; "never surfaced" means little until 30.\n`;
+      } else if (staleUnused.count) {
+        output += `Older than 30 days and never surfaced: ${staleUnused.count}`;
+        output += ` — candidates for \`brain_forget\`, or a sign the wording is not what anyone searches for\n`;
+      }
+      if (topShown.length) {
+        output += `\nMost surfaced:\n`;
+        for (const r of topShown) output += `- #${r.id} ×${r.shown_count} — ${r.preview}\n`;
+      }
+      output += `\n`;
+
       // Embeddings / vector search status
       output += `### Embeddings\n`;
       if (!embeddingsConfig) {
