@@ -187,7 +187,25 @@ def search(prompt, project, exclude):
         scored.append((score, lid, cat, content, sev, proj))
 
     scored.sort(key=lambda r: r[0])
-    return scored[:MAX_LESSONS]
+    top = scored[:MAX_LESSONS]
+
+    # Replace the head of each long lesson with the passage that matched. A
+    # second, cheap query rather than a join: only a handful of lessons survive
+    # the ranking, and the passage index is the one part of the schema a base
+    # written before it existed will not have.
+    con = bd.connect(readonly=True)
+    if con is not None:
+        try:
+            chunks = bd.best_chunks(con, prompt, [row[1] for row in top])
+        except Exception:
+            chunks = {}
+        finally:
+            con.close()
+        top = [row + (chunks.get(row[1]),) for row in top]
+    else:
+        top = [row + (None,) for row in top]
+
+    return top
 
 
 def render(hits, project):
@@ -197,12 +215,22 @@ def render(hits, project):
         "only the current one. Verify before acting: a lesson records what was "
         "true when it was written.",
     ]
-    for _score, lid, cat, content, sev, proj in hits:
+    for _score, lid, cat, content, sev, proj, chunk in hits:
         where = "this project" if proj == project else (proj or "unfiled")
-        text = str(content).strip()
+        full = str(content).strip()
+        # SHOW THE PART THAT MATCHED, NOT THE FIRST PART.
+        # Truncating a "PROBLEM — … FIX —" lesson from the top delivers the
+        # setup and cuts before the answer, which reads as a lesson that does
+        # not say anything — the worst possible use of the three slots.
+        if chunk and len(full) > MAX_CHARS_PER_LESSON:
+            text = str(chunk).strip()
+            suffix = f"\n… matching passage of a {len(full)}-character lesson"
+        else:
+            text = full
+            suffix = ""
         if len(text) > MAX_CHARS_PER_LESSON:
             text = text[:MAX_CHARS_PER_LESSON].rstrip() + " …"
-        parts.append(f"\n### #{lid} · {cat} · {sev} · {where}\n{text}")
+        parts.append(f"\n### #{lid} · {cat} · {sev} · {where}\n{text}{suffix}")
     out = "\n".join(parts)
     return out[:MAX_CHARS] if len(out) > MAX_CHARS else out
 

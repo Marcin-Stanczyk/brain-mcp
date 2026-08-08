@@ -25,9 +25,18 @@ import type { VectorIndex } from "./vector.js";
  * there to rescue an inflected word, not to have opinions about relevance.
  */
 export const RETRIEVER_WEIGHTS = {
+  /** Every term, somewhere in the lesson. */
   all: 3,
+  /**
+   * Every term inside ONE paragraph. Stronger evidence than the same terms
+   * scattered across four thousand characters, and the only retriever that can
+   * see past bm25's length normalisation into a long lesson.
+   */
+  chunkAll: 3,
   any: 1.5,
   vector: 1.5,
+  /** Any term in one paragraph — the passage index's recall arm. */
+  chunkAny: 1.2,
   prefix: 0.6,
 } as const;
 
@@ -69,6 +78,14 @@ export interface SearchQuery {
 
 export interface SearchOutcome {
   rows: LessonRow[];
+  /**
+   * lesson id → the passage that matched best.
+   *
+   * What a reader should be shown. The prompt hook used to print the first 1200
+   * characters of a lesson, which for anything written as "PROBLEM — … FIX —"
+   * is the setup without the answer, cut mid-sentence.
+   */
+  bestChunk: Map<number, string>;
   /** id → which retrievers found it. null when no query was given. */
   matchedBy: Map<number, string[]> | null;
   /** The terms actually searched for — surfaced to the caller on a miss. */
@@ -157,6 +174,7 @@ export async function searchLessons(
     return {
       rows: db.prepare(sql).all(...params) as LessonRow[],
       matchedBy: null,
+      bestChunk: new Map(),
       terms: [],
       modeNote: "",
     };
@@ -166,6 +184,7 @@ export async function searchLessons(
   const fetchN = Math.min(100, max * 5);
   const plan = planFtsQuery(query);
   const rowById = new Map<number, LessonRow>();
+  const bestChunk = new Map<number, string>();
   const lists: RankedList[] = [];
   let modeNote = "";
 
@@ -213,9 +232,70 @@ export async function searchLessons(
     lists.push({ retriever, weight, ids: rows.map((r) => Number(r.id)) });
   };
 
+  /**
+   * The same idea over paragraphs instead of whole lessons.
+   *
+   * bm25 divides by document length, so a fourteen-thousand-character lesson
+   * whose third paragraph answers the question exactly is scored as a mostly
+   * irrelevant document that happens to contain the words. Indexing paragraphs
+   * lets that paragraph compete on its own length — and identifies which part of
+   * the lesson to show, which matters more than the ranking for anything written
+   * as "PROBLEM — … FIX —".
+   *
+   * Several passages of one lesson may match; only the best-ranked counts, or a
+   * long lesson would occupy the whole result list with itself.
+   */
+  const addChunkRetriever = (retriever: string, weight: number, match: string | null): void => {
+    if (!match) return;
+    let sql = `
+      SELECT ${ROW_COLUMNS}, c.text AS chunk_text
+      FROM lesson_chunks_fts f
+      JOIN lesson_chunks c ON c.id = f.rowid
+      JOIN lessons l ON l.id = c.lesson_id
+      WHERE lesson_chunks_fts MATCH ?
+    `;
+    const params: (string | number)[] = [match];
+    if (category) {
+      sql += ` AND l.category = ?`;
+      params.push(category);
+    }
+    if (project) {
+      sql += ` AND (${projectPredicate()})`;
+      params.push(project, `%"${project}"%`);
+    }
+    sql += ` ORDER BY bm25(lesson_chunks_fts) LIMIT ?`;
+    params.push(fetchN * 3); // several passages per lesson collapse to one
+
+    let rows: (LessonRow & { chunk_text: string })[];
+    try {
+      rows = db.prepare(sql).all(...params) as (LessonRow & { chunk_text: string })[];
+    } catch (err) {
+      // A base that predates the passage index simply has no passages. Whole
+      // lessons still answer; say so once and carry on.
+      console.error(
+        `⚠️ brain-mcp: passage retriever '${retriever}' unavailable (${err instanceof Error ? err.message : String(err)}) — searching whole lessons.`
+      );
+      return;
+    }
+
+    const ids: number[] = [];
+    const seen = new Set<number>();
+    for (const row of rows) {
+      const id = Number(row.id);
+      if (seen.has(id)) continue; // keep only this lesson's best passage
+      seen.add(id);
+      ids.push(id);
+      if (!rowById.has(id)) rowById.set(id, row);
+      if (!bestChunk.has(id)) bestChunk.set(id, row.chunk_text);
+    }
+    lists.push({ retriever, weight, ids });
+  };
+
   addRetriever("all", RETRIEVER_WEIGHTS.all, plan.all);
   addRetriever("any", RETRIEVER_WEIGHTS.any, plan.any);
   addRetriever("prefix", RETRIEVER_WEIGHTS.prefix, plan.prefix);
+  addChunkRetriever("chunk-all", RETRIEVER_WEIGHTS.chunkAll, plan.all);
+  addChunkRetriever("chunk-any", RETRIEVER_WEIGHTS.chunkAny, plan.any);
 
   if (hybridEnabled) {
     // Vector search joins as one more opinion. Any embedding failure (backend
@@ -265,6 +345,7 @@ export async function searchLessons(
   return {
     rows: top.map((h) => rowById.get(h.id)).filter(Boolean) as LessonRow[],
     matchedBy: new Map(top.map((h) => [h.id, h.retrievers])),
+    bestChunk,
     terms: plan.terms,
     modeNote,
   };

@@ -144,3 +144,41 @@ def fts_prefix_query(text, max_terms=24):
     if stems == terms:
         return ""
     return " OR ".join(f'"{s}"*' for s in stems)
+
+
+def best_chunks(con, text, lesson_ids, max_terms=24):
+    """The passage of each lesson that best matches `text`.
+
+    The long lessons are the ones with the evidence in them, and they are written
+    as "PROBLEM — … CAUSE — … FIX —". Truncating from the start spends the
+    reader's attention on the setup and cuts before the answer; this returns the
+    part that actually matched.
+
+    Mirrors the chunk retrievers in src/search.ts. Returns {} rather than raising
+    when the passage index is missing — a base written before it existed still
+    answers from whole lessons, and a hook may never be the reason a prompt
+    fails.
+    """
+    if not lesson_ids:
+        return {}
+    query = fts_query(text, max_terms)
+    if not query:
+        return {}
+    placeholders = ",".join("?" for _ in lesson_ids)
+    try:
+        rows = con.execute(
+            f"""
+            SELECT c.lesson_id, c.text
+            FROM lesson_chunks_fts f
+            JOIN lesson_chunks c ON c.id = f.rowid
+            WHERE lesson_chunks_fts MATCH ? AND c.lesson_id IN ({placeholders})
+            ORDER BY bm25(lesson_chunks_fts)
+            """,
+            (query, *lesson_ids),
+        ).fetchall()
+    except Exception:
+        return {}
+    best = {}
+    for lesson_id, chunk in rows:
+        best.setdefault(lesson_id, chunk)  # rows arrive best-first
+    return best

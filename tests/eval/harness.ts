@@ -11,6 +11,7 @@ import type Database from "better-sqlite3";
 import { initDB } from "../../src/tools.js";
 import { searchLessons, severityBoosts } from "../../src/search.js";
 import { evaluate, type EvalReport, type Judgement } from "../../src/metrics.js";
+import { rebuildAllChunks } from "../../src/chunk.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -71,6 +72,10 @@ export function buildFixture(): Fixture {
     );
     idByKey.set(lesson.key, Number(info.lastInsertRowid));
   }
+  // Seeding writes rows directly, which bypasses the passage indexing that
+  // brain_learn performs. Without this the eval would silently score a
+  // retriever that is not running — the chunk lists would just be empty.
+  rebuildAllChunks(db);
   return { db, dir, idByKey };
 }
 

@@ -14,6 +14,7 @@ import { createHash } from "crypto";
 import type { Embedder, EmbeddingsConfig } from "./embeddings.js";
 import { searchLessons, severityBoosts } from "./search.js";
 import { scopeCandidates, applyGlobalScope } from "./scope.js";
+import { ensureChunks, reindexLessonChunks, removeLessonChunks, rebuildAllChunks, CHUNK_MAX } from "./chunk.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
@@ -88,6 +89,42 @@ export function initDB(dbPath: string): Database.Database {
       content_rowid='id'
     );
 
+    -- Passages. bm25 normalises by document length, so a 14k-character lesson
+    -- whose third paragraph answers the question exactly scores as a mostly
+    -- irrelevant document containing the words. Indexing paragraphs separately
+    -- lets the paragraph compete on its own length — and tells the display which
+    -- part to show, instead of the first 1200 characters of the setup.
+    -- Rows are written from TypeScript (see src/chunk.ts): splitting prose is
+    -- not expressible as a trigger, unlike the FTS mirror below.
+    CREATE TABLE IF NOT EXISTS lesson_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lesson_id INTEGER NOT NULL,
+      ord INTEGER NOT NULL,
+      text TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS lesson_chunks_by_lesson ON lesson_chunks(lesson_id);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS lesson_chunks_fts USING fts5(
+      text,
+      content='lesson_chunks',
+      content_rowid='id'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS lesson_chunks_ai AFTER INSERT ON lesson_chunks BEGIN
+      INSERT INTO lesson_chunks_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS lesson_chunks_ad AFTER DELETE ON lesson_chunks BEGIN
+      INSERT INTO lesson_chunks_fts(lesson_chunks_fts, rowid, text)
+      VALUES ('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS lesson_chunks_au AFTER UPDATE ON lesson_chunks BEGIN
+      INSERT INTO lesson_chunks_fts(lesson_chunks_fts, rowid, text)
+      VALUES ('delete', old.id, old.text);
+      INSERT INTO lesson_chunks_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
     CREATE TRIGGER IF NOT EXISTS lessons_ai AFTER INSERT ON lessons BEGIN
       INSERT INTO lessons_fts(rowid, content, category, tags, source, project)
       VALUES (new.id, new.content, new.category, new.tags, new.source, new.project);
@@ -121,6 +158,11 @@ export function initDB(dbPath: string): Database.Database {
   for (const [name, decl] of Object.entries(LATE_COLUMNS)) {
     if (!existing.has(name)) db.exec(`ALTER TABLE lessons ADD COLUMN ${name} ${decl}`);
   }
+
+  // A database that predates the passage index, or a fresh one, both want the
+  // same thing. Cheap — a few hundred lessons split on blank lines — and it
+  // never throws: without passages the search falls back to whole lessons.
+  ensureChunks(db);
 
   return db;
 }
@@ -453,6 +495,10 @@ export function createTools(
         scope || "project"
       );
 
+      // The passage index is not maintained by a trigger — splitting prose is
+      // not expressible in SQL — so every write path has to say so explicitly.
+      reindexLessonChunks(db, Number(result.lastInsertRowid), content);
+
       // Optional: embed on write. Failure never blocks the save — the lesson
       // stays unembedded and brain_reindex can pick it up later.
       let embedNote = "";
@@ -489,7 +535,7 @@ export function createTools(
       project?: string;
       limit?: number;
     }): Promise<TextResult> => {
-      const { rows: results, matchedBy, terms: searchedTerms, modeNote } =
+      const { rows: results, matchedBy, bestChunk, terms: searchedTerms, modeNote } =
         await searchLessons(
           db,
           { query, category, project, limit },
@@ -543,7 +589,19 @@ export function createTools(
         const sev = r.severity === "critical" ? "🔴" : r.severity === "important" ? "🟡" : "🔵";
         const via = matchedBy?.get(Number(r.id));
         const viaNote = via ? ` | matched: ${via.join("+")}` : "";
-        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${r.content}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}`;
+
+        // SHOW THE PART THAT MATCHED, NOT THE FIRST PART.
+        // The long lessons are the ones with the evidence in them, and they are
+        // written as "PROBLEM — … CAUSE — … FIX —". Printing them from the top
+        // spends the reader's attention on the setup; printing the passage that
+        // matched spends it on the answer. Whole lesson stays one fetch away.
+        const content = String(r.content ?? "");
+        const passage = bestChunk.get(Number(r.id));
+        const body = passage && content.length > CHUNK_MAX && passage !== content
+          ? `${passage}\n   ⤷ matching passage of a ${content.length}-character lesson — full text: brain://lessons/${r.id}`
+          : content;
+
+        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${body}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}`;
       }).join("\n\n---\n\n");
 
       const termNote = searchedTerms.length ? ` for: ${searchedTerms.join(", ")}` : "";
@@ -966,6 +1024,9 @@ export function createTools(
       });
 
       const archivedIds = archiveAndDelete();
+      // Without this an archived lesson stays reachable through its passages —
+      // soft-deleted from the list and still answering questions.
+      removeLessonChunks(db, archivedIds);
       if (vector && archivedIds.length) {
         try {
           vector.remove(archivedIds);
@@ -1029,6 +1090,10 @@ export function createTools(
       const restored = restoreOp();
       if (!restored) return { content: [{ type: "text" as const, text: `No archived lesson with id=${id}.` }] };
 
+      // Restoring is the mirror of archiving, and archiving drops the passages.
+      const back = db.prepare("SELECT content FROM lessons WHERE id = ?").get(id) as { content: string } | undefined;
+      if (back) reindexLessonChunks(db, id, back.content);
+
       return { content: [{ type: "text" as const, text: `✅ Restored lesson #${id} back to active lessons.` }] };
     },
   });
@@ -1037,16 +1102,30 @@ export function createTools(
   tools.push({
     name: "brain_reindex",
     description:
-      "Batch-embed all lessons that have no vector embedding yet (requires BRAIN_EMBEDDINGS_URL). With force:true, drops the vector index and re-embeds everything — use after changing the embedding model.",
+      "Rebuild the derived search indexes: the passage index always, and the vector embeddings when BRAIN_EMBEDDINGS_URL is set. With force:true, drops the vector index and re-embeds everything — use after changing the embedding model.",
     schema: {
       force: z.boolean().optional().default(false).describe("Re-embed ALL lessons, not just unembedded ones"),
     },
     handler: async ({ force }: { force?: boolean }): Promise<TextResult> => {
+      // PASSAGES FIRST, AND UNCONDITIONALLY.
+      // They are maintained from TypeScript rather than by a trigger, so a write
+      // path that forgets to reindex leaves a lesson searchable only as a whole.
+      // This is the repair, and it must not be gated behind an embeddings
+      // backend that most installs do not run.
+      let chunkNote = "";
+      try {
+        chunkNote = `🧩 Passage index rebuilt: ${rebuildAllChunks(db)} passages across ${
+          (db.prepare("SELECT COUNT(*) AS c FROM lessons").get() as { c: number }).c
+        } lessons.\n`;
+      } catch (err) {
+        chunkNote = `⚠️ Passage index could not be rebuilt (${err instanceof Error ? err.message : String(err)}).\n`;
+      }
+
       if (!embeddingsConfig || !embedder) {
-        return { content: [{ type: "text" as const, text: "Embeddings are disabled. Set BRAIN_EMBEDDINGS_URL (e.g. http://localhost:11434 for a local Ollama) to enable hybrid search." }] };
+        return text(chunkNote + "\nEmbeddings are disabled. Set BRAIN_EMBEDDINGS_URL (e.g. http://localhost:11434 for a local Ollama) to add semantic search.");
       }
       if (!vector) {
-        return { content: [{ type: "text" as const, text: "Vector index unavailable — the sqlite-vec extension failed to load on this platform. Search runs FTS5-only." }] };
+        return text(chunkNote + "\nVector index unavailable — the sqlite-vec extension failed to load on this platform. Search runs lexical-only.");
       }
 
       const pruned = vector.pruneOrphans();
@@ -1079,12 +1158,12 @@ export function createTools(
       }
 
       const remaining = vector.unembeddedLessonIds().length;
-      let text = `🔁 Reindex ${aborted ? "ABORTED (embeddings endpoint appears down)" : "complete"} (model: ${embeddingsConfig.model}${force ? ", force" : ""})\n\n`;
-      text += `Embedded: ${embedded}/${ids.length}\n`;
-      if (failed) text += `Failed: ${failed}\n`;
-      if (pruned) text += `Pruned orphaned vectors: ${pruned}\n`;
-      text += `Still unembedded: ${remaining}`;
-      return { content: [{ type: "text" as const, text }] };
+      let out = chunkNote + `🔁 Reindex ${aborted ? "ABORTED (embeddings endpoint appears down)" : "complete"} (model: ${embeddingsConfig.model}${force ? ", force" : ""})\n\n`;
+      out += `Embedded: ${embedded}/${ids.length}\n`;
+      if (failed) out += `Failed: ${failed}\n`;
+      if (pruned) out += `Pruned orphaned vectors: ${pruned}\n`;
+      out += `Still unembedded: ${remaining}`;
+      return text(out);
     },
   });
 
@@ -1245,7 +1324,7 @@ export function createTools(
           const hash = contentHash(l.data.content);
           if (existingHashes.has(hash)) { skippedDupes++; continue; }
           existingHashes.add(hash);
-          insertLesson.run(
+          const info = insertLesson.run(
             l.data.content,
             l.data.category,
             JSON.stringify(l.data.tags || []),
@@ -1254,6 +1333,7 @@ export function createTools(
             l.data.severity ?? "info",
             l.data.created_at ?? null
           );
+          reindexLessonChunks(db, Number(info.lastInsertRowid), l.data.content);
           inserted++;
         }
         if (Array.isArray(parsed.patterns)) {

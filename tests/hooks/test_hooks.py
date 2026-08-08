@@ -20,6 +20,7 @@ misbehaving.
 import json
 import os
 import shutil
+import re
 import sqlite3
 import subprocess
 import sys
@@ -56,6 +57,16 @@ def make_db(path, lessons):
           INSERT INTO lessons_fts(rowid, content, category, tags, source, project)
           VALUES (new.id, new.content, new.category, new.tags, new.source, new.project);
         END;
+        -- Passages, so the hook can show the part of a long lesson that matched
+        -- rather than its first 1200 characters. Mirrors src/tools.ts.
+        CREATE TABLE lesson_chunks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          lesson_id INTEGER NOT NULL, ord INTEGER NOT NULL, text TEXT NOT NULL);
+        CREATE VIRTUAL TABLE lesson_chunks_fts USING fts5(
+          text, content='lesson_chunks', content_rowid='id');
+        CREATE TRIGGER lesson_chunks_ai AFTER INSERT ON lesson_chunks BEGIN
+          INSERT INTO lesson_chunks_fts(rowid, text) VALUES (new.id, new.text);
+        END;
         """
     )
     for lesson in lessons:
@@ -71,6 +82,13 @@ def make_db(path, lessons):
              lesson.get("project", "p"), lesson.get("severity", "info"),
              "2020-01-01 00:00:00", "2020-01-01 00:00:00"),
         )
+        lesson_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", lesson["content"]) if p.strip()]
+        for i, para in enumerate(paragraphs):
+            con.execute(
+                "INSERT INTO lesson_chunks (lesson_id, ord, text) VALUES (?,?,?)",
+                (lesson_id, i, para),
+            )
     con.commit()
     con.close()
 
@@ -174,6 +192,41 @@ class TestBrainDB(unittest.TestCase):
         self.assertEqual('"zamów"* OR "koszt"*', self.bd.fts_prefix_query("zamówieniach kosztach"))
         self.assertEqual('"zamów"* OR "koszt"*', self.bd.fts_prefix_query("zamówień koszty"),
                          "both directions land on the same root")
+
+    def test_best_chunks_returns_the_passage_that_matched(self):
+        # A long lesson reads "PROBLEM — ... FIX —". Truncating it from the top
+        # delivers the setup and cuts before the answer, which is the worst
+        # possible use of the three slots the hook has.
+        tmp = tempfile.mkdtemp()
+        try:
+            db = os.path.join(tmp, "k.db")
+            make_db(db, [{"content": "PROBLEM the badge showed a positive margin\n\n"
+                                     "FIX the supplier cost is netto and the price is brutto"}])
+            con = sqlite3.connect(db)
+            try:
+                best = self.bd.best_chunks(con, "supplier netto brutto", [1])
+                self.assertIn("FIX", best[1])
+                self.assertNotIn("PROBLEM", best[1])
+                self.assertEqual({}, self.bd.best_chunks(con, "supplier", []))
+                self.assertEqual({}, self.bd.best_chunks(con, "", [1]))
+            finally:
+                con.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_best_chunks_survives_a_base_without_the_passage_index(self):
+        # A database written before passages existed must still answer from
+        # whole lessons. A hook may never be the reason a prompt fails.
+        tmp = tempfile.mkdtemp()
+        try:
+            db = os.path.join(tmp, "old.db")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE lessons (id INTEGER PRIMARY KEY, content TEXT)")
+            con.commit()
+            self.assertEqual({}, self.bd.best_chunks(con, "anything at all", [1]))
+            con.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_prefix_query_empty_when_nothing_was_stemmed(self):
         # Identical to the exact query, so running it would only add noise.

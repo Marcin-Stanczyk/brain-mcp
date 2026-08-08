@@ -1,0 +1,183 @@
+// Splitting a lesson into passages, and keeping the passage index in step.
+//
+// WHY
+// ===
+// Two separate problems, one cause: the good lessons are long.
+//
+// Ranking. bm25 normalises by document length, so a 14 000-character lesson
+// whose third paragraph answers the question exactly is scored as a mostly
+// irrelevant document that happens to contain the words. Measured on the live
+// base on 2026-08-08: 45 of 303 lessons ran past 3 000 characters, and those are
+// the ones with the evidence in them — the long ones are long because somebody
+// worked something out.
+//
+// Display. The prompt hook shows 1 200 characters per lesson, from the start.
+// For a lesson that opens with "PROBLEM —" and reaches "FIX —" at character
+// 2 400, that is the setup without the answer, cut mid-sentence.
+//
+// A passage index fixes both: the paragraph competes on its own length, and the
+// paragraph that matched is the paragraph worth showing.
+//
+// WHY NOT TRIGGERS
+// ================
+// The lessons FTS index is maintained by SQL triggers. Chunking cannot be, since
+// splitting prose is not expressible in SQLite, so every write path has to call
+// reindexLessonChunks. That is a real cost and the reason rebuildAllChunks
+// exists: any path that forgets is repaired by a rebuild, and initDB runs one
+// when it finds the table empty against a non-empty base.
+
+import type Database from "better-sqlite3";
+
+/** Below this, a lesson is one passage and splitting it would only add noise. */
+export const CHUNK_MIN = 400;
+
+/** Above this, a passage is split further — it has stopped being one thought. */
+export const CHUNK_MAX = 1000;
+
+/**
+ * Split a lesson into passages on its own structure.
+ *
+ * Blank lines first, because that is where the author already said "new
+ * thought"; then single newlines, then sentence ends, and only then a hard cut.
+ * Short neighbours are merged so the index does not fill with fragments that
+ * match everything and rank nothing.
+ */
+export function splitIntoChunks(content: string): string[] {
+  const text = String(content ?? "").trim();
+  if (!text) return [];
+  if (text.length <= CHUNK_MAX) return [text];
+
+  const paragraphs = text.split(/\n\s*\n+/).map((p) => p.trim()).filter(Boolean);
+
+  const pieces: string[] = [];
+  for (const paragraph of paragraphs) {
+    if (paragraph.length <= CHUNK_MAX) {
+      pieces.push(paragraph);
+      continue;
+    }
+    pieces.push(...splitOversized(paragraph));
+  }
+
+  // Merge forward while the result stays under CHUNK_MAX, so a heading line and
+  // the paragraph it introduces stay in one passage rather than becoming a
+  // three-word chunk that matches every query containing the heading.
+  const merged: string[] = [];
+  for (const piece of pieces) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && last.length < CHUNK_MIN && last.length + piece.length + 1 <= CHUNK_MAX) {
+      merged[merged.length - 1] = `${last}\n${piece}`;
+    } else {
+      merged.push(piece);
+    }
+  }
+  return merged.length ? merged : [text];
+}
+
+/** Break a too-long paragraph on the best boundary available. */
+function splitOversized(paragraph: string): string[] {
+  const out: string[] = [];
+  let rest = paragraph;
+  while (rest.length > CHUNK_MAX) {
+    const window = rest.slice(0, CHUNK_MAX);
+    // Prefer a line break, then a sentence end, then give up and cut. `cut` is
+    // the last resort rather than the rule: a passage that begins mid-word is
+    // worse to read than one that runs slightly long.
+    const cut =
+      lastIndexOfAfter(window, "\n", CHUNK_MIN) ??
+      lastSentenceEnd(window, CHUNK_MIN) ??
+      CHUNK_MAX;
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) out.push(rest);
+  return out.filter(Boolean);
+}
+
+function lastIndexOfAfter(text: string, needle: string, min: number): number | null {
+  const i = text.lastIndexOf(needle);
+  return i >= min ? i : null;
+}
+
+function lastSentenceEnd(text: string, min: number): number | null {
+  let best: number | null = null;
+  const re = /[.!?…](\s|$)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index >= min) best = m.index + 1;
+  }
+  return best;
+}
+
+// ── Index maintenance ───────────────────────────────────────────────────────
+
+/** Rewrite the passages for one lesson. Call after any content change. */
+export function reindexLessonChunks(
+  db: Database.Database,
+  lessonId: number,
+  content: string
+): number {
+  const remove = db.prepare("DELETE FROM lesson_chunks WHERE lesson_id = ?");
+  const add = db.prepare(
+    "INSERT INTO lesson_chunks (lesson_id, ord, text) VALUES (?, ?, ?)"
+  );
+  const chunks = splitIntoChunks(content);
+  const write = db.transaction(() => {
+    remove.run(lessonId);
+    chunks.forEach((text, i) => add.run(lessonId, i, text));
+  });
+  write();
+  return chunks.length;
+}
+
+/** Drop the passages of lessons that no longer exist, or were archived. */
+export function removeLessonChunks(db: Database.Database, lessonIds: readonly number[]): void {
+  if (!lessonIds.length) return;
+  const remove = db.prepare("DELETE FROM lesson_chunks WHERE lesson_id = ?");
+  const run = db.transaction((ids: readonly number[]) => {
+    for (const id of ids) remove.run(id);
+  });
+  run(lessonIds);
+}
+
+/**
+ * Rebuild every passage from scratch. Idempotent, and the repair for any write
+ * path that forgot to reindex — which, unlike a trigger, is a thing that can
+ * happen. Returns the number of passages written.
+ */
+export function rebuildAllChunks(db: Database.Database): number {
+  const rows = db.prepare("SELECT id, content FROM lessons").all() as
+    { id: number; content: string }[];
+  const add = db.prepare("INSERT INTO lesson_chunks (lesson_id, ord, text) VALUES (?, ?, ?)");
+  let total = 0;
+  const write = db.transaction(() => {
+    db.exec("DELETE FROM lesson_chunks");
+    for (const row of rows) {
+      splitIntoChunks(row.content).forEach((text, i) => {
+        add.run(row.id, i, text);
+        total++;
+      });
+    }
+  });
+  write();
+  return total;
+}
+
+/**
+ * Ensure the passage index exists and is populated.
+ *
+ * An empty passage table against a non-empty base means either a fresh install
+ * or a database that predates chunking; both want the same thing. Never throws
+ * — a failure here must degrade to searching whole lessons, not stop the server.
+ */
+export function ensureChunks(db: Database.Database): void {
+  try {
+    const lessons = (db.prepare("SELECT COUNT(*) AS c FROM lessons").get() as { c: number }).c;
+    if (!lessons) return;
+    const chunks = (db.prepare("SELECT COUNT(*) AS c FROM lesson_chunks").get() as { c: number }).c;
+    if (chunks === 0) rebuildAllChunks(db);
+  } catch (err) {
+    console.error(
+      `⚠️ brain-mcp: could not build the passage index (${err instanceof Error ? err.message : String(err)}) — searching whole lessons only.`
+    );
+  }
+}
