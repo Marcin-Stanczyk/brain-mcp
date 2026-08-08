@@ -295,9 +295,9 @@ test("every tool declares a Zod schema and rejects bad input", () => {
   const expected = [
     "brain_learn", "brain_recall", "brain_scan_projects", "brain_project_context",
     "brain_store_pattern", "brain_status", "brain_forget", "brain_restore",
-    "brain_reindex", "brain_export", "brain_import",
+    "brain_reindex", "brain_export", "brain_import", "brain_rescope",
   ];
-  assert.deepEqual(tools.map((t) => t.name).sort(), [...expected].sort(), "all 11 tools present");
+  assert.deepEqual(tools.map((t) => t.name).sort(), [...expected].sort(), "every tool present");
 
   for (const t of tools) {
     assert.ok(t.schema && typeof t.schema === "object", `${t.name} has a schema`);

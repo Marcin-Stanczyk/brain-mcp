@@ -13,6 +13,7 @@ import { join, dirname, sep, basename, isAbsolute, resolve } from "path";
 import { createHash } from "crypto";
 import type { Embedder, EmbeddingsConfig } from "./embeddings.js";
 import { searchLessons, severityBoosts } from "./search.js";
+import { scopeCandidates, applyGlobalScope } from "./scope.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
@@ -328,6 +329,11 @@ export function contentHash(content: string): string {
 // ── Tool definitions ────────────────────────────────────────────────────────
 
 type TextResult = { content: { type: "text"; text: string }[] };
+
+/** The shape every tool returns. A helper because it appears in all of them. */
+const text = (body: string): TextResult => ({
+  content: [{ type: "text" as const, text: body }],
+});
 
 export interface ToolDef {
   name: string;
@@ -694,6 +700,13 @@ export function createTools(
       output += `Lessons ever surfaced: ${shown.count} of ${lessons.count}`;
       output += lessons.count ? ` (${Math.round((shown.count / lessons.count) * 100)}%)\n` : `\n`;
       output += `Marked \`global\` (about a tool, not a project): ${globals.count}\n`;
+      // A mechanism nobody uses reports as a healthy zero. Say how many lessons
+      // look like they should be global, or `scope` stays decorative — which is
+      // what it was for its first months: 4 rows out of 303.
+      const rescopable = scopeCandidates(db, 200).length;
+      if (rescopable) {
+        output += `Look like tool lessons but are filed under a project: ${rescopable} — run \`brain_rescope\`\n`;
+      }
       // A LESSON CANNOT BE COUNTED BEFORE COUNTING BEGAN.
       // Reported naively, "never surfaced" is true of the entire base on the day
       // the instrumentation lands, and reads like a finding about the lessons
@@ -770,6 +783,66 @@ export function createTools(
       };
     },
   });
+
+  // Tool: Rescope — propose lessons that belong everywhere, not to one project
+  tools.push({
+    name: "brain_rescope",
+    description:
+      "Find lessons filed under a project that are really about a tool (a shell trap, a git behaviour, an ABI mismatch) and should be marked global so they surface in every project. Lists proposals with evidence by default; pass ids + apply:true to reclassify them.",
+    schema: {
+      ids: z.array(z.number().int().positive()).max(200).optional()
+        .describe("Lesson ids to reclassify. Required when apply is true."),
+      apply: z.boolean().optional().default(false)
+        .describe("Actually set scope='global' on the given ids. Without it, nothing is written."),
+      limit: z.number().int().min(1).max(200).optional().default(25)
+        .describe("Max proposals to list"),
+    },
+    handler: async ({ ids, apply, limit }: {
+      ids?: number[];
+      apply?: boolean;
+      limit?: number;
+    }): Promise<TextResult> => {
+      // PROPOSING AND APPLYING ARE SEPARATE CALLS ON PURPOSE.
+      // The detector is a keyword heuristic. Letting it rewrite hundreds of rows
+      // unattended would be worse than leaving them alone: a wrong `global` is
+      // noise injected into every future search in every project, and unlike a
+      // missing one it is invisible — it looks like a result.
+      if (apply) {
+        if (!ids?.length) {
+          return text("Nothing to apply: pass the ids you want marked global. Run without `apply` to see proposals.");
+        }
+        const changed = applyGlobalScope(db, ids);
+        const skipped = ids.length - changed;
+        return text(
+          `Marked ${changed} lesson(s) as global.` +
+          (skipped ? ` ${skipped} were already global or do not exist.` : "") +
+          `\nThey now surface in every project, not just the one they were learned in.`
+        );
+      }
+
+      const candidates = scopeCandidates(db, limit || 25);
+      const globalCount = (db.prepare(
+        "SELECT COUNT(*) AS c FROM lessons WHERE COALESCE(scope, 'project') = 'global'"
+      ).get() as { c: number }).c;
+
+      if (!candidates.length) {
+        return text(`No project-scoped lessons look like tool lessons. ${globalCount} are already global.`);
+      }
+
+      const lines = candidates.map((c) =>
+        `#${c.id} [${c.project ?? "unfiled"}] ${c.preview}\n    evidence: ${c.matched.join(", ")}`
+      ).join("\n\n");
+
+      return text(
+        `${candidates.length} lesson(s) look like they are about a tool rather than a project ` +
+        `(${globalCount} already global).\n\n${lines}\n\n` +
+        `These are proposals, not findings — each names no project and mentions the tool words listed. ` +
+        `Reclassify the ones you agree with:\n` +
+        `  brain_rescope({ ids: [${candidates.slice(0, 3).map((c) => c.id).join(", ")}], apply: true })`
+      );
+    },
+  });
+
 
   // Tool: Archive lessons (soft-delete — never loses data)
   tools.push({
