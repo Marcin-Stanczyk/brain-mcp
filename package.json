@@ -21,7 +21,8 @@
     "postinstall": "node scripts/postinstall-notice.mjs",
     "test:hooks": "python3 -m unittest discover -s tests/hooks",
     "test:all": "npm test && npm run test:hooks",
-    "eval": "tsx scripts/eval.mjs"
+    "eval": "tsx scripts/eval.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
