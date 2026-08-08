@@ -295,6 +295,12 @@ Or in a JSON-based client config:
 
 ### 1. `brain_learn` — store a lesson
 
+Takes `scope: "global"` for a lesson about a **tool** rather than a project — a
+shell trap, a git behaviour, an API limit. Those recur everywhere, and filing
+them under whichever project happened to be open is what made them invisible in
+the repositories where the mistake actually repeats. `UserPromptSubmit` boosts
+them. The default stays `project`.
+
 Saves an insight, gotcha, or problem solution to the database.
 
 **When the agent should use it:** after fixing a hard bug, discovering a gotcha, or finding the best approach to something.
