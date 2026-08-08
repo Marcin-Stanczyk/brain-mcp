@@ -303,18 +303,26 @@ export async function searchLessons(
     // retrievers to answer alone.
     try {
       const queryVec = await embedder!(query);
-      const knnHits = vector!.knn(queryVec, fetchN * 2);
-      const getRow = db.prepare(`SELECT ${ROW_COLUMNS} FROM lessons l WHERE l.id = ?`);
+      // Nearest PASSAGES, not lessons — one vector per lesson would average a
+      // problem, a cause and a fix into a point close to none of them.
+      const knnHits = vector!.knn(queryVec, fetchN * 3);
+      const getByChunk = db.prepare(
+        `SELECT ${ROW_COLUMNS}, c.text AS chunk_text
+         FROM lesson_chunks c JOIN lessons l ON l.id = c.lesson_id
+         WHERE c.id = ?`
+      );
       const vecIds: number[] = [];
+      const seen = new Set<number>();
       for (const hit of knnHits) {
-        let row = rowById.get(hit.id);
-        if (!row) {
-          row = getRow.get(hit.id) as LessonRow | undefined;
-          if (!row) continue; // stale vector for a deleted lesson
-          rowById.set(hit.id, row);
-        }
-        if (!passesFilters(row, category, project)) continue;
-        vecIds.push(hit.id);
+        const found = getByChunk.get(hit.id) as (LessonRow & { chunk_text: string }) | undefined;
+        if (!found) continue; // stale vector for a passage that no longer exists
+        const lessonId = Number(found.id);
+        if (seen.has(lessonId)) continue; // a lesson ranks by its nearest passage
+        if (!passesFilters(found, category, project)) continue;
+        seen.add(lessonId);
+        if (!rowById.has(lessonId)) rowById.set(lessonId, found);
+        if (!bestChunk.has(lessonId)) bestChunk.set(lessonId, found.chunk_text);
+        vecIds.push(lessonId);
         if (vecIds.length >= fetchN) break;
       }
       lists.push({ retriever: "vector", weight: RETRIEVER_WEIGHTS.vector, ids: vecIds });

@@ -163,21 +163,35 @@ export function rebuildAllChunks(db: Database.Database): number {
 }
 
 /**
- * Ensure the passage index exists and is populated.
+ * Ensure every lesson has passages, and index the ones that do not.
  *
- * An empty passage table against a non-empty base means either a fresh install
- * or a database that predates chunking; both want the same thing. Never throws
- * — a failure here must degrade to searching whole lessons, not stop the server.
+ * CHECKING FOR AN EMPTY TABLE IS NOT ENOUGH, which is how this was first
+ * written and what `npm run doctor` caught: one lesson out of 304 had no
+ * passages, because it was written by a path that did not reindex. An empty
+ * table repairs itself on the next start; a table missing one row out of a
+ * thousand never does, and the lesson simply stops being findable by the
+ * retriever that reads long lessons well.
+ *
+ * Costs one indexed query on a populated base, so it can run on every start.
+ * Never throws — a failure here must degrade to searching whole lessons, not
+ * stop the server.
  */
-export function ensureChunks(db: Database.Database): void {
+export function ensureChunks(db: Database.Database): number {
   try {
-    const lessons = (db.prepare("SELECT COUNT(*) AS c FROM lessons").get() as { c: number }).c;
-    if (!lessons) return;
-    const chunks = (db.prepare("SELECT COUNT(*) AS c FROM lesson_chunks").get() as { c: number }).c;
-    if (chunks === 0) rebuildAllChunks(db);
+    const missing = db
+      .prepare(
+        "SELECT id, content FROM lessons WHERE id NOT IN (SELECT lesson_id FROM lesson_chunks)"
+      )
+      .all() as { id: number; content: string }[];
+    for (const lesson of missing) reindexLessonChunks(db, lesson.id, lesson.content);
+    if (missing.length) {
+      console.error(`ℹ️ brain-mcp: indexed passages for ${missing.length} lesson(s) that had none.`);
+    }
+    return missing.length;
   } catch (err) {
     console.error(
       `⚠️ brain-mcp: could not build the passage index (${err instanceof Error ? err.message : String(err)}) — searching whole lessons only.`
     );
+    return 0;
   }
 }

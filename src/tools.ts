@@ -409,21 +409,39 @@ export function createTools(
     options.dataDir ?? (db.name && db.name !== ":memory:" ? dirname(db.name) : null);
   const hybridEnabled = Boolean(vector && embedder);
 
-  /** Embed one lesson and store its vector. Returns true on success. */
-  const embedLesson = (id: number, content: string): Promise<boolean> => {
+  /** Embed one passage and store its vector. Returns true on success. */
+  const embedChunk = (chunkId: number, text: string): Promise<boolean> => {
     if (!vector || !embedder || !embeddingsConfig) return Promise.resolve(false);
-    return embedder(content).then(
+    return embedder(text).then(
       (vec) => {
-        vector.upsert(id, vec, embeddingsConfig.model);
+        vector.upsert(chunkId, vec, embeddingsConfig.model);
         return true;
       },
       (err) => {
         console.error(
-          `⚠️ brain-mcp: embedding failed for lesson #${id} (${err instanceof Error ? err.message : String(err)}) — saved without embedding, run brain_reindex later.`
+          `⚠️ brain-mcp: embedding failed for passage #${chunkId} (${err instanceof Error ? err.message : String(err)}) — saved without embedding, run brain_reindex later.`
         );
         return false;
       }
     );
+  };
+
+  /**
+   * Embed every passage of a lesson. Returns true only if all of them landed —
+   * a partially embedded lesson is reported as unembedded so brain_reindex
+   * picks up the remainder rather than declaring the job done.
+   */
+  const embedLesson = async (lessonId: number): Promise<boolean> => {
+    if (!vector || !embedder || !embeddingsConfig) return false;
+    const chunks = db
+      .prepare("SELECT id, text FROM lesson_chunks WHERE lesson_id = ? ORDER BY ord")
+      .all(lessonId) as { id: number; text: string }[];
+    if (!chunks.length) return false;
+    let all = true;
+    for (const chunk of chunks) {
+      if (!(await embedChunk(chunk.id, chunk.text))) all = false;
+    }
+    return all;
   };
 
   // Tool: Learn — store a lesson/insight/pattern
@@ -503,7 +521,7 @@ export function createTools(
       // stays unembedded and brain_reindex can pick it up later.
       let embedNote = "";
       if (hybridEnabled) {
-        const ok = await embedLesson(Number(result.lastInsertRowid), content);
+        const ok = await embedLesson(Number(result.lastInsertRowid));
         embedNote = ok ? "\nEmbedded: yes" : "\nEmbedded: no (endpoint unavailable — run brain_reindex later)";
       }
 
@@ -852,11 +870,11 @@ export function createTools(
           } catch { /* unreachable */ }
         }
         const embedded = vector.embeddedCount();
-        const unembedded = lessons.count - embedded;
+        const unembedded = vector.unembeddedChunks().length;
         output += reachable
           ? `Mode: enabled (${embeddingsConfig.model} @ ${embeddingsConfig.url})\n`
           : `Mode: enabled (${embeddingsConfig.model} @ ${embeddingsConfig.url}) — endpoint UNREACHABLE, recall falls back to FTS5-only\n`;
-        output += `Embedded lessons: ${embedded} | Unembedded: ${unembedded}`;
+        output += `Embedded passages: ${embedded} (covering ${vector.embeddedLessonCount()} lessons) | Unembedded passages: ${unembedded}`;
         if (unembedded > 0) output += ` (run brain_reindex to embed them)`;
         output += `\n\n`;
       }
@@ -1024,16 +1042,19 @@ export function createTools(
       });
 
       const archivedIds = archiveAndDelete();
-      // Without this an archived lesson stays reachable through its passages —
-      // soft-deleted from the list and still answering questions.
-      removeLessonChunks(db, archivedIds);
+      // ORDER MATTERS. The vectors are keyed by passage, so they can only be
+      // found by joining through lesson_chunks — dropping the passages first
+      // would strand every vector as an orphan.
       if (vector && archivedIds.length) {
         try {
-          vector.remove(archivedIds);
+          vector.removeByLesson(archivedIds);
         } catch (err) {
           console.error(`⚠️ brain-mcp: failed to drop vectors for archived lessons (${err instanceof Error ? err.message : String(err)})`);
         }
       }
+      // Without this an archived lesson stays reachable through its passages —
+      // soft-deleted from the list and still answering questions.
+      removeLessonChunks(db, archivedIds);
 
       return {
         content: [{ type: "text" as const, text: `📦 Archived ${archivedIds.length} lesson(s) → lessons_archive table.\nReason: ${reason}\n\nData is preserved and can be restored.` }],
@@ -1131,8 +1152,9 @@ export function createTools(
       const pruned = vector.pruneOrphans();
       if (force) vector.clear();
 
-      const ids = vector.unembeddedLessonIds();
-      const getContent = db.prepare("SELECT content FROM lessons WHERE id = ?");
+      // The unit of work is a passage, because the unit of embedding is. The
+      // rebuild above may have just created them, so this is read after it.
+      const pending = vector.unembeddedChunks();
 
       let embedded = 0;
       let failed = 0;
@@ -1140,16 +1162,15 @@ export function createTools(
       const MAX_CONSECUTIVE_FAILURES = 3;
       let aborted = false;
 
-      for (const id of ids) {
-        const row = getContent.get(id) as { content: string } | undefined;
-        if (!row) continue;
-        const ok = await embedLesson(id, row.content);
-        if (ok) {
+      for (const chunk of pending) {
+        if (await embedChunk(chunk.id, chunk.text)) {
           embedded++;
           consecutiveFailures = 0;
         } else {
           failed++;
           consecutiveFailures++;
+          // A dead endpoint fails every call. Stopping after three keeps a
+          // reindex of a thousand passages from becoming a thousand timeouts.
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
             aborted = true;
             break;
@@ -1157,12 +1178,12 @@ export function createTools(
         }
       }
 
-      const remaining = vector.unembeddedLessonIds().length;
+      const remaining = vector.unembeddedChunks().length;
       let out = chunkNote + `🔁 Reindex ${aborted ? "ABORTED (embeddings endpoint appears down)" : "complete"} (model: ${embeddingsConfig.model}${force ? ", force" : ""})\n\n`;
-      out += `Embedded: ${embedded}/${ids.length}\n`;
+      out += `Embedded: ${embedded}/${pending.length} passage(s)\n`;
       if (failed) out += `Failed: ${failed}\n`;
       if (pruned) out += `Pruned orphaned vectors: ${pruned}\n`;
-      out += `Still unembedded: ${remaining}`;
+      out += `Still unembedded: ${remaining} passage(s)`;
       return text(out);
     },
   });

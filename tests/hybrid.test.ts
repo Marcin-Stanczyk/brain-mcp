@@ -223,7 +223,9 @@ test("brain_learn still saves when the embeddings endpoint is down (marked unemb
     const text = textOf(learned);
     assert.match(text, /Lesson #\d+ stored/, "lesson saved despite embedding failure");
     assert.match(text, /Embedded: no/, "marked unembedded");
-    assert.equal(vector.unembeddedLessonIds().length, 1);
+    // The unit is a passage now: a short lesson is one, and a long one leaves
+    // several pending. Either way the backlog is non-empty and reindex sees it.
+    assert.ok(vector.unembeddedChunks().length >= 1, "the passage is left for brain_reindex");
   } finally {
     serverDown = false;
   }
@@ -282,22 +284,25 @@ test("vector layer unavailable (sqlite-vec failed) → tools run FTS5-only, no c
 
 // ── brain_reindex ───────────────────────────────────────────────────────────
 
-test("brain_reindex embeds the backlog of unembedded lessons", async () => {
-  assert.equal(vector.unembeddedLessonIds().length, 1, "one lesson pending from the outage");
+test("brain_reindex embeds the backlog left by an outage", async () => {
+  const pending = vector.unembeddedChunks().length;
+  assert.ok(pending >= 1, "something is pending from the outage");
 
   const result = await toolByName("brain_reindex").handler({});
   const text = textOf(result);
   assert.match(text, /Reindex complete/);
-  assert.match(text, /Embedded: 1\/1/);
-  assert.match(text, /Still unembedded: 0/);
-  assert.equal(vector.unembeddedLessonIds().length, 0);
+  assert.match(text, new RegExp(`Embedded: ${pending}/${pending} passage`));
+  assert.match(text, /Still unembedded: 0 passage/);
+  assert.equal(vector.unembeddedChunks().length, 0);
+  // The passage index is rebuilt unconditionally, so this reports on it too.
+  assert.match(text, /Passage index rebuilt/);
 });
 
 test("brain_reindex force:true re-embeds everything", async () => {
-  const total = (db.prepare("SELECT COUNT(*) c FROM lessons").get() as { c: number }).c;
+  const total = (db.prepare("SELECT COUNT(*) c FROM lesson_chunks").get() as { c: number }).c;
   const result = await toolByName("brain_reindex").handler({ force: true });
   const text = textOf(result);
-  assert.match(text, new RegExp(`Embedded: ${total}/${total}`));
+  assert.match(text, new RegExp(`Embedded: ${total}/${total} passage`));
   assert.equal(vector.embeddedCount(), total);
 });
 
@@ -328,12 +333,71 @@ test("archiving a lesson removes its embedding", async () => {
   const id = Number(textOf(learned).match(/Lesson #(\d+)/)?.[1]);
   const beforeCount = vector.embeddedCount();
 
+  const chunksOfLesson =
+    (db.prepare("SELECT COUNT(*) c FROM lesson_chunks WHERE lesson_id = ?").get(id) as { c: number }).c;
+
   await toolByName("brain_forget").handler({ id, confirm: true, reason: "test" });
-  assert.equal(vector.embeddedCount(), beforeCount - 1);
+  assert.equal(vector.embeddedCount(), beforeCount - chunksOfLesson);
+  // The vectors hang off the passages, so they can only be found by joining
+  // through them — archiving has to drop the vectors FIRST or they survive as
+  // orphans that keep answering questions about a lesson that is gone.
+  assert.equal(vector.pruneOrphans(), 0, "no vector outlived its passage");
+});
+
+// ── Passage-level embeddings ────────────────────────────────────────────────
+
+test("a long lesson is embedded per passage, and found by the passage that matches", async () => {
+  // ONE VECTOR PER LESSON AVERAGES ITS SUBJECTS INTO A POINT NEAR NONE OF THEM.
+  // This lesson is about three things. The query names only the third, and with
+  // a single whole-document vector the first two would drag it out of reach.
+  const learned = await toolByName("brain_learn").handler({
+    content:
+      "PROBLEM — " + "the nightly export produced a file the importer rejected. ".repeat(12) +
+      "\n\nCAUSE — " + "two components disagreed about the column order in the header. ".repeat(12) +
+      "\n\nFIX — pin the schema with a checksum written by the exporter and verified by the importer before the first row is read",
+    category: "deployment",
+  });
+  const id = Number(textOf(learned).match(/Lesson #(\d+)/)![1]);
+
+  const chunks =
+    (db.prepare("SELECT COUNT(*) c FROM lesson_chunks WHERE lesson_id = ?").get(id) as { c: number }).c;
+  assert.ok(chunks >= 3, "split into passages");
   assert.equal(
-    (db.prepare("SELECT COUNT(*) c FROM lesson_embeddings WHERE lesson_id = ?").get(id) as { c: number }).c,
-    0
+    (db.prepare(
+      "SELECT COUNT(*) c FROM chunk_embeddings e JOIN lesson_chunks c ON c.id = e.chunk_id WHERE c.lesson_id = ?"
+    ).get(id) as { c: number }).c,
+    chunks,
+    "every passage carries its own vector"
   );
+
+  const found = await toolByName("brain_recall").handler({
+    query: "checksum verified before the first row is read",
+    limit: 5,
+  });
+  const text = textOf(found);
+  assert.ok(text.includes(`#${id}`), "the lesson is found by its last passage");
+  assert.match(text, /matching passage of a \d+-character lesson/, "and that passage is what is shown");
+  assert.match(text, /FIX —/, "the answer, not the problem statement");
+});
+
+test("a lesson-level vector index from an older version is dropped, not misread", async () => {
+  // Its ids are lesson ids, and they now mean passage ids: kept, the index
+  // would answer with passages that do not exist. Derived data — brain_reindex
+  // rebuilds it — so dropping is the safe reading, not a loss.
+  const old = initDB(join(workDir, "legacy-vectors.db"));
+  old.exec("CREATE TABLE lessons_vec (lesson_id INTEGER PRIMARY KEY, embedding BLOB)");
+  old.exec("CREATE TABLE lesson_embeddings (lesson_id INTEGER PRIMARY KEY, model TEXT, dim INTEGER)");
+  old.prepare("INSERT INTO lessons_vec (lesson_id, embedding) VALUES (1, x'00')").run();
+
+  const migrated = await loadVectorIndex(old);
+  assert.ok(migrated, "the index still loads");
+  assert.equal(
+    (old.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name = 'lessons_vec'").get() as { c: number }).c,
+    0,
+    "the lesson-keyed table is gone"
+  );
+  assert.equal(migrated!.embeddedCount(), 0, "and starts empty rather than wrong");
+  old.close();
 });
 
 // ── brain_status embeddings reporting ───────────────────────────────────────
@@ -341,7 +405,7 @@ test("archiving a lesson removes its embedding", async () => {
 test("brain_status reports embeddings mode and embedded/unembedded counts", async () => {
   const up = textOf(await toolByName("brain_status").handler({}));
   assert.match(up, /Mode: enabled \(mock-model @ http:\/\/127\.0\.0\.1:\d+\)/);
-  assert.match(up, /Embedded lessons: \d+ \| Unembedded: 0/);
+  assert.match(up, /Embedded passages: \d+ \(covering \d+ lessons\) \| Unembedded passages: 0/);
   assert.ok(!up.includes("UNREACHABLE"));
 
   serverDown = true;

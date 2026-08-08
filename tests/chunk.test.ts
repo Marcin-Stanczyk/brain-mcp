@@ -170,6 +170,36 @@ test("reindexing one lesson replaces its passages rather than adding to them", (
   removeLessonChunks(db, []); // must not throw
 });
 
+test("ensureChunks repairs partial coverage, not just an empty index", () => {
+  // AN EMPTY TABLE IS THE EASY CASE AND NOT THE DANGEROUS ONE.
+  // A base missing one lesson out of a thousand looks healthy by volume and
+  // never repairs itself, and that lesson quietly stops being findable by the
+  // retriever that reads long lessons well. npm run doctor found exactly this
+  // on the live base: 1060 passages, 304 lessons, one of them with none.
+  const partial = initDB(join(workDir, "partial.db"));
+  partial.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
+    .run("a lesson that arrived through a path which did not reindex");
+  partial.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
+    .run(PROBLEM_THEN_FIX);
+  rebuildAllChunks(partial);
+  const orphan = Number(
+    partial.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
+      .run("added afterwards, with nothing indexing it").lastInsertRowid
+  );
+  assert.equal(
+    (partial.prepare("SELECT COUNT(*) AS c FROM lesson_chunks WHERE lesson_id = ?").get(orphan) as { c: number }).c,
+    0,
+    "the gap exists"
+  );
+
+  assert.equal(ensureChunks(partial), 1, "exactly the missing lesson is indexed");
+  assert.ok(
+    (partial.prepare("SELECT COUNT(*) AS c FROM lesson_chunks WHERE lesson_id = ?").get(orphan) as { c: number }).c > 0
+  );
+  assert.equal(ensureChunks(partial), 0, "and a covered base is left alone");
+  partial.close();
+});
+
 test("ensureChunks builds a missing index and leaves a present one alone", () => {
   const fresh = initDB(join(workDir, "fresh.db"));
   fresh.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
@@ -180,12 +210,11 @@ test("ensureChunks builds a missing index and leaves a present one alone", () =>
   const built = (fresh.prepare("SELECT COUNT(*) AS c FROM lesson_chunks").get() as { c: number }).c;
   assert.ok(built >= 3, "an empty index against a non-empty base gets built");
 
-  fresh.prepare("DELETE FROM lesson_chunks WHERE id = (SELECT MIN(id) FROM lesson_chunks)").run();
   ensureChunks(fresh);
   assert.equal(
     (fresh.prepare("SELECT COUNT(*) AS c FROM lesson_chunks").get() as { c: number }).c,
-    built - 1,
-    "a populated index is not rebuilt behind the caller's back"
+    built,
+    "a fully covered base is not rebuilt behind the caller's back"
   );
   fresh.close();
 });

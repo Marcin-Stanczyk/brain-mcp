@@ -6,7 +6,8 @@ Brain MCP is a **local MCP (Model Context Protocol) server** that acts as long-t
 
 Features:
 
-- **Hybrid search** — FTS5 keyword search always; plus vector/semantic search (sqlite-vec + local Ollama embeddings) when you opt in, merged with reciprocal rank fusion
+- **Search you can ask in a sentence** — five lexical retrievers over whole lessons and over passages, merged by weighted reciprocal rank fusion; plus vector search (sqlite-vec + a local embeddings server) when you opt in
+- **Measured, not asserted** — a committed corpus of judged queries, scored by `npm run eval` and enforced in CI, so a ranking change produces a number rather than an impression
 - **MCP resources** — browse lessons and project summaries as `brain://` resources, no tool calls needed
 - **Export/import** — human-readable markdown or lossless JSON, with content-hash dedupe on import
 - **Project scanner** — indexes your code directory's tech stacks from metadata files
@@ -22,8 +23,10 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
     │                                      ├── SQLite DB (knowledge.db)
     │                                      │   ├── lessons            (lessons / insights)
     │                                      │   ├── lessons_fts        (full-text search, FTS5)
-    │                                      │   ├── lessons_vec        (vector index, sqlite-vec — optional)
-    │                                      │   ├── lesson_embeddings  (embedding bookkeeping)
+    │                                      │   ├── lesson_chunks      (passages — one paragraph each)
+    │                                      │   ├── lesson_chunks_fts  (passage full-text index, FTS5)
+    │                                      │   ├── chunks_vec         (passage vectors, sqlite-vec — optional)
+    │                                      │   ├── chunk_embeddings   (embedding bookkeeping)
     │                                      │   ├── lessons_archive    (soft-deleted lessons)
     │                                      │   ├── project_index      (project scans)
     │                                      │   └── patterns           (architectural patterns)
@@ -45,8 +48,13 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | File | Role |
 |------|------|
 | `src/index.ts` | Server entry point — wires tools + resources to the MCP stdio transport |
-| `src/tools.ts` | Core logic — DB setup, project scanner, the 11 MCP tools |
+| `src/tools.ts` | Tool definitions and presentation — DB setup, project scanner, the 12 MCP tools |
 | `src/query.ts` | Turns a question into FTS5 queries — tokenizing, stopwords, stemming |
+| `src/search.ts` | Retrieval — runs the retrievers, fuses them, returns rows (no formatting) |
+| `src/chunk.ts` | Splits lessons into passages and keeps that index in step |
+| `src/scope.ts` | Proposes lessons that are about a tool rather than a project |
+| `src/metrics.ts` | recall@k, precision@k, MRR — so ranking changes produce numbers |
+| `src/preflight.ts` | Turns a startup crash (ABI mismatch, missing module) into instructions |
 | `src/embeddings.ts` | Optional embeddings client (Ollama) + weighted reciprocal rank fusion |
 | `src/vector.ts` | sqlite-vec vector index (loads the extension, degrades gracefully) |
 | `src/resources.ts` | MCP resources: `brain://lessons/{id}`, `brain://projects/{name}` |
@@ -57,6 +65,9 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `hooks/incident_watch.py` | `PostToolUse` hook — catches undo commands and repeat failures as they happen |
 | `scripts/install-hooks.mjs` | Registers/removes the hooks in Claude Code settings (merging, idempotent) |
 | `scripts/import-claude-memory.py` | Imports Claude Code's `memory/*.md` files into the indexed store |
+| `scripts/doctor.mjs` | `npm run doctor` — checks node ABI, build, indexes, MCP config, hooks |
+| `scripts/eval.mjs` | `npm run eval` — retrieval quality report against the judged query set |
+| `tests/eval/` | Committed fixture corpus + judged queries, with CI thresholds |
 | `tests/*.test.ts` | Test suites (`node:test`, temp DBs, fixture dirs, mocked embeddings HTTP) |
 | `dist/index.js` | Compiled JS (what your MCP client runs) |
 | `data/knowledge.db` | SQLite database with all knowledge (WAL mode, gitignored) |
@@ -294,7 +305,7 @@ Or in a JSON-based client config:
 }
 ```
 
-## The 11 tools
+## The 12 tools
 
 ### 1. `brain_learn` — store a lesson
 
@@ -338,10 +349,18 @@ merged by weighted reciprocal rank fusion:
 
 | Retriever | Matches | Weight | What it is for |
 |-----------|---------|--------|----------------|
-| `all` | every term | 3 | precision — a lesson about exactly this |
+| `all` | every term, anywhere in the lesson | 3 | precision — a lesson about exactly this |
+| `chunk-all` | every term inside **one paragraph** | 3 | the only way past bm25's length penalty into a long lesson |
 | `any` | any term | 1.5 | recall — the question spans several lessons |
-| `prefix` | any stem | 0.6 | morphology — `zamówieniach` finds `zamówienia`, `backfilling` finds `backfill` |
-| `vector` | semantic neighbours | 1.5 | only when [embeddings](#hybrid-vector-search-optional) are enabled |
+| `vector` | nearest **passages** | 1.5 | only when [embeddings](#hybrid-vector-search-optional) are enabled |
+| `chunk-any` | any term in one paragraph | 1.2 | the passage index's recall arm |
+| `prefix` | any stem | 0.6 | morphology — `zamówieniach` reaches `zamówień`, `backfilling` reaches `backfill` |
+
+For a lesson longer than ~1000 characters, the response shows **the passage that
+matched** rather than the first 1200 characters, with the whole text one
+`brain://lessons/{id}` fetch away. The long lessons are the ones with the
+evidence in them, and they are written as "PROBLEM — … CAUSE — … FIX —":
+truncating from the top delivers the setup and cuts before the answer.
 
 Results are annotated with the retrievers that found them (`matched: all+any`),
 and the response names the terms actually searched for — including on a miss, so
@@ -527,6 +546,40 @@ brain-mcp makes **zero** network calls out of the box. There is exactly **one** 
    - `important` — will save hours of work
    - `info` — useful, not critical
    - `tip` — nice to know
+
+## Is it working?
+
+Two commands answer that without guesswork.
+
+```bash
+npm run doctor    # is the installation sound?
+npm run eval      # is the retrieval any good?
+```
+
+`doctor` checks the things that have actually broken: a native module built for
+a different Node ABI (which an MCP client reports as "could not connect"), a
+config pointing at a directory that moved, bare `node` in a config, a stale
+`dist/`, an index that has fallen behind, and whether the hooks are registered.
+It is read-only — it prints what is wrong and what to run.
+
+`eval` scores retrieval against `tests/eval/`: a committed corpus and judged
+queries, including ones that must return **nothing**. The same thresholds run in
+`npm test`, so a ranking regression fails the build instead of being discovered
+months later by someone concluding the knowledge base is empty.
+
+```
+lexical-answerable — 19 queries
+  recall@5        100.0%
+  precision@1      82.4%
+  MRR               0.897
+  zero-result       0.0%
+  true negatives  100.0%
+```
+
+Two of the 21 queries are marked `requiresSemantic` and scored separately: an
+English question against a Polish lesson shares meaning and no words at all, and
+no amount of lexical tuning reaches it. That is the measured cost of running
+without embeddings.
 
 ## Maintenance
 

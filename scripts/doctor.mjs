@@ -98,10 +98,19 @@ if (!Database) {
     // is the one that can silently fall behind.
     try {
       const chunks = one("SELECT COUNT(*) FROM lesson_chunks");
+      // Coverage, not volume. "1060 passages across 304 lessons" reads healthy
+      // and is compatible with one lesson having none — which is exactly what
+      // this check found the first time it ran, and that lesson was invisible
+      // to the retriever that reads long lessons well.
+      const uncovered = one(
+        "SELECT COUNT(*) FROM lessons WHERE id NOT IN (SELECT lesson_id FROM lesson_chunks)"
+      );
       if (lessons > 0 && chunks === 0) {
-        warn("passage index is empty — run brain_reindex, or restart the server to build it");
+        warn("passage index is empty — restart the server, or run brain_reindex");
+      } else if (uncovered > 0) {
+        warn(`${uncovered} lesson(s) have no passages — restart the server, or run brain_reindex`);
       } else {
-        ok(`passage index: ${chunks} passages across ${lessons} lessons`);
+        ok(`passage index: ${chunks} passages covering all ${lessons} lessons`);
       }
     } catch {
       warn("passage index missing — it is built on the next server start");
