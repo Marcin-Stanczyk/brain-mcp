@@ -33,6 +33,7 @@ that would have mattered arrives in a block already tuned out.
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -61,6 +62,30 @@ PREFIX_PENALTY = 2.0
 # hook silent rather than chatty: an irrelevant hit costs more than a miss,
 # because it is what teaches the reader to stop reading.
 MIN_TERMS = 2
+
+# HOW MUCH OF THE QUESTION A LESSON HAS TO ACTUALLY CONTAIN.
+#
+# Ranking alone cannot answer "is anything here relevant?" — it only orders
+# whatever came back, so the top three of a bad list are still three. Measured
+# on the live base on 2026-08-08 the hook fired on 8 prompts out of 10, spending
+# ~840 tokens on WooCommerce deploy lessons in reply to "napisz mi funkcję
+# sortującą tablicę". Those hits shared exactly ONE term with the question; the
+# genuinely relevant ones shared three to five. Coverage separates them where
+# bm25 does not, because bm25 is relative to the other candidates and this is a
+# question about the question.
+#
+# Worse than the noise was what the never-repeat rule did with it: asking the
+# same thing five times in one session returned fifteen DIFFERENT lessons,
+# descending into the ranking — by the fifth prompt they were the 13th to 15th
+# best, still at full price. A floor turns that into silence, which is the
+# correct answer to "I have already told you everything I know about this".
+MIN_COVERED_TERMS = 2
+MIN_COVERAGE_RATIO = 0.6
+# ...but capped, because a ratio alone scales the wrong way. A ten-word question
+# would demand six shared terms, which no lesson has, so the hook would fall
+# silent exactly when the user finally gave it plenty to work with. Three shared
+# terms is strong evidence however long the question is.
+MAX_COVERAGE_FLOOR = 3
 
 
 def project_name(cwd):
@@ -170,9 +195,19 @@ def search(prompt, project, exclude):
     finally:
         con.close()
 
+    # The stems the retrievers matched on, so a lesson found through an inflected
+    # form counts the word it actually shares rather than being penalised twice.
+    stems = [w[:5] if len(w) >= 6 else w for w in bd.fts_terms(prompt)]
+    floor = min(MAX_COVERAGE_FLOOR,
+                max(MIN_COVERED_TERMS, math.ceil(len(stems) * MIN_COVERAGE_RATIO)))
+
     scored = []
     for lid, cat, content, sev, proj, scope, rank in rows:
         if lid in exclude:
+            continue
+        # A lesson has to contain enough of the question to be worth 800 tokens
+        # of somebody's context. Below the floor there is no ranking to do.
+        if sum(1 for stem in stems if stem in str(content).lower()) < floor:
             continue
         score = float(rank)
         # SAME PROJECT WINS TIES, IT DOES NOT WIN OUTRIGHT.

@@ -353,6 +353,44 @@ class TestRelevantLessons(HookCase):
         self.assertIsNotNone(ctx)
         self.assertEqual(1, ctx.count("\n### #"))
 
+    def test_stays_silent_when_nothing_shares_enough_of_the_question(self):
+        # SILENCE IS THE FEATURE, AND IT WAS MISSING.
+        # Ranking orders whatever came back; it cannot say "none of this is
+        # relevant", so the top three of a bad list were still three. Measured
+        # on the live base the hook fired on 8 prompts in 10, once answering
+        # "napisz mi funkcję sortującą tablicę" with 840 tokens of WooCommerce
+        # deploy lessons. Those shared one term with the question.
+        self.assertIsNone(
+            self.context_of(self.ask("napisz mi funkcje sortujaca tablice liczb")),
+            "a lesson sharing one incidental word is not worth 800 tokens",
+        )
+
+    def test_a_question_spread_across_several_lessons_still_returns(self):
+        # The floor must not undo the bug this whole hook exists for: no single
+        # lesson holds every term of a real question, and demanding that is how
+        # the knowledge base came to look empty.
+        ctx = self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE"))
+        self.assertIsNotNone(ctx)
+        self.assertIn("SIGPIPE", ctx)
+
+    def test_the_floor_is_capped_so_long_questions_do_not_silence_it(self):
+        # A ratio alone scales the wrong way: ten terms would demand six shared
+        # ones, which nothing has, so the hook would fall silent exactly when
+        # the user finally gave it plenty to work with.
+        ctx = self.context_of(self.ask(
+            "bash pipefail SIGPIPE checkout gateway BLIK invoice numbering ERP export"))
+        self.assertIsNotNone(ctx, "three shared terms is enough however long the question")
+
+    def test_asking_the_same_thing_repeatedly_converges_to_silence(self):
+        # The never-repeat rule used to guarantee ESCALATING irrelevance: five
+        # identical prompts returned fifteen different lessons, descending into
+        # the ranking at full price. Running out of relevant lessons should look
+        # like running out, not like more lessons.
+        seen = [self.context_of(self.ask("bash pipefail head exit 141 SIGPIPE", session="rep"))
+                for _ in range(5)]
+        self.assertIsNotNone(seen[0], "the first ask is answered")
+        self.assertIsNone(seen[-1], "the base does not invent a fifth answer")
+
     def test_output_is_a_well_formed_UserPromptSubmit_payload(self):
         proc = self.ask("bash pipefail head exit 141 SIGPIPE silent")
         payload = json.loads(proc.stdout)
