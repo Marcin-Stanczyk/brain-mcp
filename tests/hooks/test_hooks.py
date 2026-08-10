@@ -466,6 +466,70 @@ class TestProjectName(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # session_context
 # ---------------------------------------------------------------------------
+class TestSessionContextGlobalScope(HookCase):
+    """A lesson marked `global` has to open every session, not just its own.
+
+    That is the entire content of the column, and this hook ignored it. Measured
+    on the live base on 2026-08-10: twelve lessons were marked global — a
+    `set -euo pipefail` trap, `git checkout --` after a mutation test, a Stripe
+    signature trap — and a session in any other repository started with zero of
+    them. brain_recall and the prompt hook had both been taught to cross the
+    project boundary; this one had not, in the place it matters most.
+    """
+
+    lessons = [
+        {"content": "set -euo pipefail piped into head exits 141 on SIGPIPE, silently",
+         "project": "agent-worktrees", "severity": "critical"},
+        {"content": "the kanarix pricing table is generated at build time",
+         "project": "kanarix", "severity": "info"},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        # The column arrives by migration on a real base, so add it the same way.
+        con = sqlite3.connect(self.db)
+        con.execute("ALTER TABLE lessons ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'")
+        con.execute("UPDATE lessons SET scope = 'global' WHERE content LIKE 'set -euo%'")
+        con.commit()
+        con.close()
+
+    def test_a_global_lesson_opens_a_session_in_an_unrelated_project(self):
+        ctx = self.context_of(self.run_hook("session_context.py",
+                                            {"cwd": "/code/kanarix", "session_id": "s"}))
+        self.assertIsNotNone(ctx)
+        self.assertIn("SIGPIPE", ctx, "the trap travels to the project where it would recur")
+        self.assertIn("agent-worktrees", ctx, "and says where it came from")
+
+    def test_a_project_lesson_still_does_not_travel(self):
+        ctx = self.context_of(self.run_hook("session_context.py",
+                                            {"cwd": "/code/elsewhere", "session_id": "s"}))
+        if ctx:
+            self.assertNotIn("pricing table", ctx, "crossing is what `global` buys, not the default")
+
+    def test_a_base_without_the_column_still_starts(self):
+        # Older databases have no `scope`. The hook must degrade to project-only
+        # rather than raise — a hook that throws breaks somebody's session.
+        plain = os.path.join(self.tmp, "old.db")
+        make_db(plain, [{"content": "a lesson about kamar deployment", "project": "kamar"}])
+        proc = self.run_hook("session_context.py", {"cwd": "/code/kamar", "session_id": "s"}, db=plain)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("brain-mcp memory", self.context_of(proc))
+
+
+class TestSessionContextSnippets(HookCase):
+    lessons = [{"content": "słowo " * 200, "project": "kamar", "severity": "critical"}]
+
+    def test_previews_are_cut_on_a_word_boundary(self):
+        # Cutting mid-word ("wygladaja jak j") reads as a corrupted lesson
+        # rather than a shortened one, and the reader cannot tell which.
+        ctx = self.context_of(self.run_hook("session_context.py",
+                                            {"cwd": "/code/kamar", "session_id": "s"}))
+        line = next(l for l in ctx.split("\n") if l.startswith(("!", "-")))
+        self.assertTrue(line.endswith("…"), line)
+        body = line.split("] ", 1)[1].removesuffix(" …")
+        self.assertTrue(all(w == "słowo" for w in body.split()), f"no partial word: {body[-20:]!r}")
+
+
 class TestSessionContext(HookCase):
     lessons = (
         [{"content": f"critical lesson number {i} about deployment", "project": "kamar",

@@ -51,6 +51,21 @@ SNIPPET_CHARS = 220
 STATE_DIR = _brain_db.STATE_DIR   # one definition, in _brain_db
 
 
+def clip(text: str, limit: int) -> str:
+    """Cut to `limit`, on a word boundary, with an ellipsis when shortened.
+
+    Cutting mid-word ("wygladaja jak j") reads as a corrupted lesson rather than
+    a shortened one, and the reader cannot tell which it is.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:") + " …"
+
+
 def project_name(cwd: str) -> str:
     return os.path.basename(cwd.rstrip("/")) or "unknown"
 
@@ -216,6 +231,32 @@ def fetch_lessons(project: str):
         ).fetchall()
         seen = {r[1] for r in rows}
         room = max(0, MAX_LESSONS + MAX_GLOBAL_CRITICALS - len(rows))
+
+        # LESSONS MARKED `global` BELONG IN EVERY SESSION — THAT IS THE COLUMN.
+        # This hook filtered by project alone, so a session in any other
+        # repository opened with none of them. Measured on 2026-08-10: twelve
+        # lessons were marked global — `set -euo pipefail` piped into head,
+        # `git checkout --` after a mutation test, a Stripe signature trap — and
+        # a session in kanarix or vs-beauty saw zero. brain_recall and the
+        # prompt hook were taught to cross the project boundary; this one was
+        # not, which is the place it matters most: before the first token.
+        if room and "scope" in {r[1] for r in con.execute("PRAGMA table_info(lessons)")}:
+            extra = con.execute(
+                "SELECT category, content, severity, project FROM lessons "
+                "WHERE COALESCE(scope, 'project') = 'global' "
+                "  AND project IS NOT ? "
+                "ORDER BY CASE severity WHEN 'critical' THEN 0 ELSE 1 END, "
+                "         updated_at DESC LIMIT ?",
+                (project, min(room, MAX_GLOBAL_CRITICALS)),
+            ).fetchall()
+            for r in extra:
+                if r[1] not in seen:
+                    rows.append(r)
+                    seen.add(r[1])
+            room = max(0, MAX_LESSONS + MAX_GLOBAL_CRITICALS - len(rows))
+
+        # Retained for bases that predate `scope`: naming whole projects as
+        # cross-cutting was the older way of saying the same thing.
         if room and GLOBAL_PROJECTS:
             marks = ",".join("?" * len(GLOBAL_PROJECTS))
             extra = con.execute(
@@ -332,7 +373,7 @@ def main():
             # mark cross-cutting criticals so they aren't mistaken for
             # something specific to the project currently open
             tag = f"[{cat}]" if proj == project else f"[{cat} · {proj}]"
-            one = " ".join(str(content).split())[:SNIPPET_CHARS]
+            one = clip(" ".join(str(content).split()), SNIPPET_CHARS)
             parts.append(f"{flag} {tag} {one}")
         parts.append(
             "\nUse `brain_recall` to read any of these in full, and `brain_learn` "
