@@ -55,6 +55,7 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `src/scope.ts` | Proposes lessons that are about a tool rather than a project |
 | `src/metrics.ts` | recall@k, precision@k, MRR — so ranking changes produce numbers |
 | `src/preflight.ts` | Turns a startup crash (ABI mismatch, missing module) into instructions |
+| `src/backfill.ts` | Embeds the vector backlog on startup, without blocking the transport |
 | `src/embeddings.ts` | Optional embeddings client (Ollama) + weighted reciprocal rank fusion |
 | `src/vector.ts` | sqlite-vec vector index (loads the extension, degrades gracefully) |
 | `src/resources.ts` | MCP resources: `brain://lessons/{id}`, `brain://projects/{name}` |
@@ -581,6 +582,17 @@ change (every query matches nothing while `brain_status` still says "enabled")
 names itself and tells you to run `brain_reindex force:true`, and `npm run
 doctor` pings the backend named in your MCP config rather than trusting that it
 is up.
+
+The vector index also heals itself. Passages are written on every `brain_learn`;
+vectors only when a backend was configured **and** reachable at that moment, and
+the two drift apart for ordinary reasons — a session started before embeddings
+were configured, an offline laptop, a model mid-pull. On startup the server
+embeds whatever backlog it finds, after the transport is connected so it answers
+questions throughout, stopping after a few consecutive failures rather than
+turning a dead backend into a thousand timeouts. "Run `brain_reindex`" is a fine
+repair and a poor design: it needs somebody to notice, and the symptom of not
+noticing is that some lessons are quietly unreachable by meaning while every
+report says healthy.
 
 ### Tuning the similarity floor
 

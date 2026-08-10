@@ -7,6 +7,7 @@ import { embeddingsConfigFromEnv, createEmbedder, withCircuitBreaker } from "./e
 import { loadVectorIndex } from "./vector.js";
 import { registerResources } from "./resources.js";
 import { reportStartupFailure } from "./preflight.js";
+import { backfillEmbeddings } from "./backfill.js";
 
 // Directory that gets scanned for projects (BRAIN_CODE_DIR, legacy CODE_DIR, default: ~/code)
 const CODE_DIR = process.env.BRAIN_CODE_DIR || process.env.CODE_DIR || join(homedir(), "code");
@@ -59,6 +60,14 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Heal the vector backlog AFTER the transport is up, so the server answers
+  // questions throughout. Passages are written by every brain_learn; vectors
+  // only when a backend was configured and reachable at that moment, and the
+  // two drift apart for ordinary reasons. Deliberately not awaited.
+  if (vector && embedder && embeddingsConfig) {
+    void backfillEmbeddings({ db, vector, embedder, model: embeddingsConfig.model });
+  }
   console.error(
     `🧠 Brain MCP server running${embeddingsConfig ? (vector ? ` (hybrid search: ${embeddingsConfig.model})` : " (FTS5-only: sqlite-vec unavailable)") : ""}`
   );

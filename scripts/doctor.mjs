@@ -232,7 +232,10 @@ if (!declaredUrl) {
         db.prepare("SELECT COUNT(*) FROM chunk_embeddings e JOIN lesson_chunks c ON c.id = e.chunk_id").get()
       )[0];
       if (embedded < chunks) {
-        warn(`${chunks - embedded} of ${chunks} passages have no vector — run brain_reindex`);
+        warn(
+          `${chunks - embedded} of ${chunks} passages have no vector.\n` +
+          `       The server embeds the backlog on its next start; brain_reindex forces it now.`
+        );
       } else {
         ok(`all ${chunks} passages embedded`);
       }
