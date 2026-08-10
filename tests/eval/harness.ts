@@ -12,6 +12,8 @@ import { initDB } from "../../src/tools.js";
 import { searchLessons, severityBoosts } from "../../src/search.js";
 import { evaluate, type EvalReport, type Judgement } from "../../src/metrics.js";
 import { rebuildAllChunks } from "../../src/chunk.js";
+import { createEmbedder, embeddingsConfigFromEnv, type Embedder } from "../../src/embeddings.js";
+import { loadVectorIndex, type VectorIndex } from "../../src/vector.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -51,6 +53,9 @@ export interface Fixture {
   dir: string;
   /** corpus key → row id, so judgements can be written against stable names. */
   idByKey: Map<string, number>;
+  /** Present only when the fixture was built with embeddings. */
+  vector?: VectorIndex | null;
+  embedder?: Embedder | null;
 }
 
 /** Build a fresh database containing exactly the fixture corpus. */
@@ -79,6 +84,32 @@ export function buildFixture(): Fixture {
   return { db, dir, idByKey };
 }
 
+/**
+ * The same fixture with every passage embedded, or null when no backend is
+ * configured.
+ *
+ * Deliberately opt-in and separate: `npm test` must not depend on a running
+ * embeddings server, and CI thresholds are asserted on what lexical retrieval
+ * alone achieves. This exists so the question "did embeddings earn their
+ * place?" is answered by the same judged queries as everything else, rather
+ * than by the fact that they were installed.
+ */
+export async function buildEmbeddedFixture(): Promise<Fixture | null> {
+  const cfg = embeddingsConfigFromEnv();
+  if (!cfg) return null;
+  const fixture = buildFixture();
+  const vector = await loadVectorIndex(fixture.db);
+  if (!vector) return null;
+  const embedder = createEmbedder(cfg);
+  const chunks = fixture.db
+    .prepare("SELECT id, text FROM lesson_chunks ORDER BY id")
+    .all() as { id: number; text: string }[];
+  for (const chunk of chunks) {
+    vector.upsert(chunk.id, await embedder(chunk.text), cfg.model);
+  }
+  return { ...fixture, vector, embedder };
+}
+
 export interface ScoredQuery extends JudgedQuery {
   judgement: Judgement;
   /** Keys actually returned, best first — the readable form of a failure. */
@@ -104,7 +135,7 @@ export async function runEval(fixture: Fixture, limit = 10): Promise<EvalResult>
     const { rows } = await searchLessons(
       db,
       { query: q.query, project: q.project, category: q.category, limit },
-      { severityBoost: boosts }
+      { severityBoost: boosts, vector: fixture.vector, embedder: fixture.embedder }
     );
     const returned = rows.map((r) => Number(r.id));
     scored.push({

@@ -67,6 +67,7 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `scripts/import-claude-memory.py` | Imports Claude Code's `memory/*.md` files into the indexed store |
 | `scripts/doctor.mjs` | `npm run doctor` — checks node ABI, build, indexes, MCP config, hooks |
 | `scripts/eval.mjs` | `npm run eval` — retrieval quality report against the judged query set |
+| `scripts/sweep.mjs` | `npm run eval:sweep` — derives the vector similarity floor by measuring it |
 | `tests/eval/` | Committed fixture corpus + judged queries, with CI thresholds |
 | `tests/*.test.ts` | Test suites (`node:test`, temp DBs, fixture dirs, mocked embeddings HTTP) |
 | `dist/index.js` | Compiled JS (what your MCP client runs) |
@@ -352,7 +353,7 @@ merged by weighted reciprocal rank fusion:
 | `all` | every term, anywhere in the lesson | 3 | precision — a lesson about exactly this |
 | `chunk-all` | every term inside **one paragraph** | 3 | the only way past bm25's length penalty into a long lesson |
 | `any` | any term | 1.5 | recall — the question spans several lessons |
-| `vector` | nearest **passages** | 1.5 | only when [embeddings](#hybrid-vector-search-optional) are enabled |
+| `vector` | nearest **passages**, above a similarity floor | 1.5 | only when [embeddings](#hybrid-vector-search-optional) are enabled |
 | `chunk-any` | any term in one paragraph | 1.2 | the passage index's recall arm |
 | `prefix` | any stem | 0.6 | morphology — `zamówieniach` reaches `zamówień`, `backfilling` reaches `backfill` |
 
@@ -547,6 +548,28 @@ brain-mcp makes **zero** network calls out of the box. There is exactly **one** 
    - `info` — useful, not critical
    - `tip` — nice to know
 
+### Tuning the similarity floor
+
+KNN always returns *k* neighbours, and nearest is not the same as near — without
+a floor the vector retriever answers every question, including the ones whose
+answer is nothing. Wiring vectors in without one was measured: precision@1 rose
+from 82% to 88% **and the true-negative rate collapsed from 100% to 0%**. Asked
+about Kubernetes, a base containing nothing about Kubernetes returned five
+lessons about bash and ABI mismatches, confidently.
+
+Embeddings are normalised to unit length, so the floor is plain cosine
+similarity and means the same thing whatever model produces it. It still belongs
+to the *pair* of model and corpus, so re-derive it when you change models:
+
+```bash
+BRAIN_EMBEDDINGS_URL=http://localhost:11434 \
+BRAIN_EMBEDDINGS_MODEL=bge-m3 npm run eval:sweep
+```
+
+Read the table for a plateau rather than a peak — a threshold on the edge of a
+cliff is overfitted to the query set. With bge-m3 the plateau runs 0.45–0.52,
+which is why `BRAIN_MIN_SIMILARITY` defaults to 0.5.
+
 ## Is it working?
 
 Two commands answer that without guesswork.
@@ -576,10 +599,21 @@ lexical-answerable — 19 queries
   true negatives  100.0%
 ```
 
-Two of the 21 queries are marked `requiresSemantic` and scored separately: an
-English question against a Polish lesson shares meaning and no words at all, and
-no amount of lexical tuning reaches it. That is the measured cost of running
-without embeddings.
+Two of the 21 queries are marked `requiresSemantic`: an English question against
+a Polish lesson shares meaning and no words at all, and no amount of lexical
+tuning reaches it. With embeddings on, every judged query is satisfied:
+
+| | lexical only | + nomic-embed-text | + bge-m3 |
+|---|---|---|---|
+| recall@5 (all 21) | 92.1% | 92.1% | **100%** |
+| precision@1 | 82.4% | 88.2% | **94.1%** |
+| MRR | 0.897 | 0.924 | **0.961** |
+| true negatives | 100% | 100% | 100% |
+
+`nomic-embed-text` is the obvious choice and it does not work here: it raised
+precision and left the cross-lingual gap exactly where it was, because it is an
+English-centric model and this base is written in two languages. Pick a
+multilingual one.
 
 ## Maintenance
 

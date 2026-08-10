@@ -22,7 +22,8 @@
     "test:hooks": "python3 -m unittest discover -s tests/hooks",
     "test:all": "npm test && npm run test:hooks",
     "eval": "tsx scripts/eval.mjs",
-    "doctor": "node scripts/doctor.mjs"
+    "doctor": "node scripts/doctor.mjs",
+    "eval:sweep": "tsx scripts/sweep.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

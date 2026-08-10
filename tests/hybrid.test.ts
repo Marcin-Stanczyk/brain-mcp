@@ -14,13 +14,17 @@ import { tmpdir } from "os";
 import { join } from "path";
 import type Database from "better-sqlite3";
 import { initDB, createTools, type ToolDef } from "../src/tools.js";
+import { searchLessons } from "../src/search.js";
 import {
   rrfFuse,
   createEmbedder,
   embeddingsConfigFromEnv,
+  similarityFromDistance,
   DEFAULT_EMBEDDINGS_MODEL,
+  KEEP_ALIVE,
   type EmbeddingsConfig,
 } from "../src/embeddings.js";
+import { MIN_VECTOR_SIMILARITY } from "../src/search.js";
 import { loadVectorIndex, type VectorIndex } from "../src/vector.js";
 
 // ── RRF merge logic (pure function) ─────────────────────────────────────────
@@ -342,6 +346,75 @@ test("archiving a lesson removes its embedding", async () => {
   // through them — archiving has to drop the vectors FIRST or they survive as
   // orphans that keep answering questions about a lesson that is gone.
   assert.equal(vector.pruneOrphans(), 0, "no vector outlived its passage");
+});
+
+// ── Distance, similarity, and the floor ─────────────────────────────────────
+
+test("every embedding is unit length, so distance means the same thing per model", async () => {
+  // Raw L2 distance is a magic number belonging to one model: with
+  // nomic-embed-text relevant passages landed between 7.4 and 14.3, with
+  // bge-m3 between 0.36 and 0.75. Normalised, the ordering is cosine and the
+  // threshold survives a change of model.
+  const vec = await createEmbedder(cfg)("some text to embed");
+  let sum = 0;
+  for (const v of vec) sum += v * v;
+  assert.ok(Math.abs(Math.sqrt(sum) - 1) < 1e-5, `unit length, got ${Math.sqrt(sum)}`);
+});
+
+test("similarity is recovered exactly from distance between unit vectors", () => {
+  assert.ok(Math.abs(similarityFromDistance(0) - 1) < 1e-12, "identical vectors");
+  assert.ok(Math.abs(similarityFromDistance(Math.SQRT2) - 0) < 1e-12, "orthogonal");
+  assert.ok(Math.abs(similarityFromDistance(2) - -1) < 1e-12, "opposite");
+});
+
+test("the request asks the backend to keep the model resident", async () => {
+  // Ollama unloads after five minutes, and a cold load took ~9s. Without this
+  // every quiet spell ends in a timeout on somebody's next question, which
+  // degrades silently to lexical-only and looks like "embeddings do not help".
+  const seen: string[] = [];
+  const spy = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen.push(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ embedding: mockEmbedding("x") }));
+    });
+  });
+  await new Promise<void>((r) => spy.listen(0, "127.0.0.1", r));
+  const addr = spy.address() as { port: number };
+  try {
+    await createEmbedder({ ...cfg, url: `http://127.0.0.1:${addr.port}` })("hello");
+    assert.equal(JSON.parse(seen[0]).keep_alive, KEEP_ALIVE);
+  } finally {
+    spy.close();
+  }
+});
+
+test("a distant passage is not named at all — nearest is not the same as near", async () => {
+  // KNN ALWAYS RETURNS K NEIGHBOURS. Measured the first time vectors were
+  // wired in: precision@1 rose 82%→88% and MRR 0.897→0.922, while the
+  // true-negative rate collapsed from 100% to 0%. Asked about Kubernetes, a
+  // base with nothing about Kubernetes answered with five lessons, confidently.
+  assert.ok(MIN_VECTOR_SIMILARITY > 0, "there is a floor at all");
+
+  const learned = await toolByName("brain_learn").handler({
+    content: "zebra migration patterns across the Serengeti in the dry season",
+    category: "client",
+  });
+  const id = Number(textOf(learned).match(/Lesson #(\d+)/)![1]);
+
+  // The mock embedder is bag-of-words, so a query sharing no vocabulary is far
+  // away in exactly the sense the floor is meant to catch.
+  const { rows } = await searchLessons(
+    db,
+    { query: "quarterly amortisation schedule", limit: 10 },
+    { vector, embedder: createEmbedder(cfg) }
+  );
+  assert.ok(
+    !rows.map((r) => Number(r.id)).includes(id),
+    "an unrelated lesson is not dragged in by being the least far away"
+  );
 });
 
 // ── Passage-level embeddings ────────────────────────────────────────────────

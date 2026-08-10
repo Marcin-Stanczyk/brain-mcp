@@ -10,7 +10,7 @@
 // them; neither knows about the other.
 
 import type Database from "better-sqlite3";
-import { rrfFuse, type Embedder, type RankedList } from "./embeddings.js";
+import { rrfFuse, similarityFromDistance, type Embedder, type RankedList } from "./embeddings.js";
 import { planFtsQuery } from "./query.js";
 import type { VectorIndex } from "./vector.js";
 
@@ -42,6 +42,29 @@ export const RETRIEVER_WEIGHTS = {
 
 /** Lessons filed as being about a tool rather than a project travel further. */
 export const SCOPE_GLOBAL_BOOST = 1.05;
+
+/**
+ * How similar a passage has to be before the vector retriever will name it.
+ *
+ * KNN ALWAYS RETURNS K NEIGHBOURS. Nearest is not the same as near, so without
+ * a floor the vector retriever answers every question, including the ones whose
+ * answer is "nothing". Measured on the judged set the first time vectors were
+ * wired in: precision@1 rose from 82% to 88% and MRR from 0.897 to 0.922 — and
+ * the true-negative rate collapsed from 100% to 0%. Asked about Kubernetes, a
+ * base containing nothing about Kubernetes returned five lessons about bash and
+ * ABI mismatches, confidently.
+ *
+ * Vectors are unit length (see normalize in embeddings.ts), so this is plain
+ * cosine similarity and means the same thing whatever model produces them.
+ * Calibrated by sweeping it against the judged queries rather than guessed.
+ * With bge-m3 the curve is flat and wide — 0.45 to 0.52 all score recall@5
+ * 100%, precision@1 94.1% and true negatives 100% — so 0.5 sits in the middle
+ * of a plateau rather than on the edge of a cliff. Below 0.40 the negatives
+ * start coming back; above 0.55 the cross-lingual matches drop out of the top
+ * five. Re-run `npm run eval` after changing the model: the number belongs to
+ * the pair, not to either one.
+ */
+export const MIN_VECTOR_SIMILARITY = Number(process.env.BRAIN_MIN_SIMILARITY) || 0.5;
 
 export interface LessonRow {
   id: number;
@@ -314,6 +337,8 @@ export async function searchLessons(
       const vecIds: number[] = [];
       const seen = new Set<number>();
       for (const hit of knnHits) {
+        // Near enough to be worth saying out loud, or not said at all.
+        if (similarityFromDistance(hit.distance) < MIN_VECTOR_SIMILARITY) continue;
         const found = getByChunk.get(hit.id) as (LessonRow & { chunk_text: string }) | undefined;
         if (!found) continue; // stale vector for a passage that no longer exists
         const lessonId = Number(found.id);
