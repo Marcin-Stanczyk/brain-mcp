@@ -38,7 +38,11 @@ GENERIC_PROMPT = (
     "non-obvious — a trap in the code, an architectural decision, an external "
     "API constraint, a repeatable pattern — record it now with brain_learn "
     "(or brain_store_pattern for a reusable pattern). Do NOT record what is "
-    "already visible in the code, in git history, or in CLAUDE.md. If there "
+    "already visible in the code, in git history, or in CLAUDE.md. If the "
+    "lesson is about a TOOL rather than this project — a shell trap, a git "
+    "behaviour, an API limit — pass scope=\"global\" so it reaches the other "
+    "repositories too. Default severity to `info`; reserve `critical` for "
+    "things whose absence loses data, money, or production. If there "
     "genuinely was nothing worth keeping, say so in one sentence and finish."
 )
 
@@ -53,7 +57,25 @@ INCIDENT_PROMPT = (
     "  CAUSE    — the mechanism, not the symptom\n"
     "  FIX      — what actually resolved it\n"
     "  VERIFY   — the check that proved it, and would have caught it earlier\n"
-    "\nUse severity=critical if it could destroy work again.{global_hint}\n"
+    # SEVERITY, CALIBRATED — AND THE BIAS NAMED.
+    # This prompt only fires after something went wrong, so "it went wrong" is
+    # true of everything it will ever ask about and cannot be what makes a
+    # lesson critical. The line here used to read "use severity=critical if it
+    # could destroy work again", which is an instruction to pick critical, and
+    # the base shows it worked: of the lessons written in the days after the
+    # tool's own severity guidance was added, 100% came out critical or
+    # important. A description asking for restraint does not survive contact
+    # with an agent that has just been burned; removing the nudge might.
+    "\nSeverity is how much it costs someone NOT to know this, not how much it "
+    "cost you to find out — you are being asked because something went wrong, "
+    "so that part is already true of every answer:\n"
+    "  critical  — ignoring it loses data, money, or production\n"
+    "  important — ignoring it costs a rebuild or an hour of confusion\n"
+    "  info      — worth knowing, costs nothing to miss (a good default)\n"
+    "\nIf the lesson is about a TOOL rather than this project — a shell trap, a "
+    "git behaviour, an API limit, anything that would repeat in a different "
+    "repository — pass scope=\"global\" so it reaches the sessions where the "
+    "mistake would actually recur.{global_hint}\n"
     "\nIf every one of them was routine, say so in one sentence and finish."
 )
 
@@ -63,16 +85,18 @@ GLOBAL_PROJECTS = [p.strip() for p in os.environ.get(
 
 
 def global_hint():
-    """Only mention the cross-cutting project when one is actually configured.
+    """The older, configured way of saying "this lesson is cross-cutting".
 
-    The engine must not ship a project name — which projects are cross-cutting
-    is a property of the user's knowledge base, not of this code.
+    `scope="global"` supersedes it and needs no configuration, so the main
+    prompt names that unconditionally; this only adds the project-based route
+    when somebody has actually set it up. The engine must not ship a project
+    name — which projects are cross-cutting is a property of the user's
+    knowledge base, not of this code.
     """
     if not GLOBAL_PROJECTS:
         return ""
     names = " or ".join(f"project={p}" for p in GLOBAL_PROJECTS)
-    return (f" For tooling lessons use {names} — those are injected into every "
-            f"session regardless of directory.")
+    return (f" Lessons filed under {names} are injected into every session too.")
 
 
 def read_incidents(session_id):

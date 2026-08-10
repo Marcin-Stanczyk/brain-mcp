@@ -466,6 +466,57 @@ class TestProjectName(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # session_context
 # ---------------------------------------------------------------------------
+class TestCapturePromptCalibration(unittest.TestCase):
+    """What the Stop hook asks for is what the base ends up containing.
+
+    Measured on 2026-08-10: of the lessons written after `severity` finally got
+    a description in the tool schema, 100% came out critical or important — up
+    from 89%. The description was not the binding constraint. This prompt was:
+    it fires only after something went wrong, and then said outright "use
+    severity=critical if it could destroy work again", which is an instruction
+    to pick critical addressed to an agent that has just been burned.
+
+    It also never mentioned `scope`, which is why 12 lessons out of 318 are
+    global — the write path did not know the mechanism existed.
+    """
+
+    def setUp(self):
+        import capture_lesson
+        self.cap = capture_lesson
+
+    def text(self):
+        return (self.cap.INCIDENT_PROMPT.format(n=1, listing="  - x",
+                                                global_hint=self.cap.global_hint())
+                + "\n" + self.cap.GENERIC_PROMPT)
+
+    def test_it_no_longer_tells_the_writer_to_pick_critical(self):
+        self.assertNotIn("severity=critical", self.text(),
+                         "an instruction to pick critical is not a calibration")
+
+    def test_every_severity_is_described_by_what_it_costs(self):
+        t = self.text()
+        for level in ("critical", "important", "info"):
+            self.assertIn(level, t)
+        self.assertIn("costs someone NOT to know this", t)
+        self.assertIn("a good default", t, "info has to be presented as the default")
+
+    def test_it_names_the_selection_bias(self):
+        # Every lesson this prompt asks about follows something going wrong, so
+        # "it went wrong" cannot be the thing that makes one critical.
+        self.assertIn("already true of every answer", self.text())
+
+    def test_the_write_path_knows_scope_exists(self):
+        t = self.text()
+        self.assertIn('scope="global"', t)
+        self.assertIn("different repository", t)
+
+    def test_the_project_based_route_stays_optional(self):
+        # `scope` supersedes it and needs no configuration, so the engine must
+        # not imply a project name it was never told about.
+        self.assertEqual("", self.cap.global_hint(),
+                         "nothing configured, nothing suggested")
+
+
 class TestSessionContextGlobalScope(HookCase):
     """A lesson marked `global` has to open every session, not just its own.
 

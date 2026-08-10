@@ -839,6 +839,25 @@ export function createTools(
           output += `• ${row.severity}: ${row.count} (${Math.round(share * 100)}%)` +
             (boost ? ` → ranking boost ×${boost.toFixed(2)}\n` : `\n`);
         }
+        // THE SAME NUMBER FOR WHAT IS ARRIVING, NOT ONLY FOR WHAT IS STORED.
+        // The whole-base share moves at the speed of the whole base, so a change
+        // to how lessons are written is invisible in it for months. Splitting
+        // out the recent window is what turned "the tool's severity description
+        // should help" into a measurement — it showed 100% raised among lessons
+        // written after that description landed, i.e. the description had not
+        // been the binding constraint at all.
+        const recent = db.prepare(
+          "SELECT COALESCE(severity, 'info') AS severity, COUNT(*) AS count FROM lessons " +
+          "WHERE created_at >= datetime('now', '-30 days') GROUP BY 1"
+        ).all() as { severity: string; count: number }[];
+        const recentTotal = recent.reduce((n, r) => n + r.count, 0);
+        if (recentTotal >= 10) {
+          const recentRaised = recent
+            .filter((r) => r.severity === "critical" || r.severity === "important")
+            .reduce((n, r) => n + r.count, 0) / recentTotal;
+          output += `Last 30 days: ${recentTotal} lessons, ${Math.round(recentRaised * 100)}% critical or important\n`;
+        }
+
         const raised = bySeverity
           .filter((r) => r.severity === "critical" || r.severity === "important")
           .reduce((n, r) => n + r.count, 0) / lessons.count;
