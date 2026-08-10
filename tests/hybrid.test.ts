@@ -20,6 +20,9 @@ import {
   createEmbedder,
   embeddingsConfigFromEnv,
   similarityFromDistance,
+  withCircuitBreaker,
+  EmbeddingsUnavailableError,
+  BREAKER_FAILURE_THRESHOLD,
   DEFAULT_EMBEDDINGS_MODEL,
   KEEP_ALIVE,
   type EmbeddingsConfig,
@@ -348,6 +351,92 @@ test("archiving a lesson removes its embedding", async () => {
   assert.equal(vector.pruneOrphans(), 0, "no vector outlived its passage");
 });
 
+// ── Circuit breaker ─────────────────────────────────────────────────────────
+//
+// A dead backend must cost ONE timeout, not one per question. Measured against
+// a socket that accepts and never answers: every recall paid the full 10s and
+// then returned exactly the lexical-only result it would have returned
+// instantly — five questions, fifty seconds, nothing gained.
+
+const timeoutError = () => Object.assign(new Error("aborted"), { name: "TimeoutError" });
+
+test("one hung call is enough to stop paying for the next one", async () => {
+  let calls = 0;
+  let clock = 0;
+  const embed = withCircuitBreaker(
+    async () => { calls++; throw timeoutError(); },
+    { now: () => clock }
+  );
+
+  await assert.rejects(embed("x"), /aborted/, "the first call still fails on its own terms");
+  await assert.rejects(embed("x"), EmbeddingsUnavailableError, "the second does not wait at all");
+  assert.equal(calls, 1, "the backend was contacted once — the timeout is what it cost");
+});
+
+test("a cheap failure is forgiven once — it may be a blip", async () => {
+  let calls = 0;
+  let clock = 0;
+  const embed = withCircuitBreaker(
+    async () => { calls++; throw new Error("ECONNREFUSED"); },
+    { now: () => clock }
+  );
+
+  // A refused connection returns in milliseconds, so there is nothing to save
+  // by reacting to a single one.
+  for (let i = 0; i < BREAKER_FAILURE_THRESHOLD; i++) {
+    await assert.rejects(embed("x"), /ECONNREFUSED/);
+  }
+  assert.equal(calls, BREAKER_FAILURE_THRESHOLD, "each one reached the backend");
+  await assert.rejects(embed("x"), EmbeddingsUnavailableError, "and then it stops");
+});
+
+test("a backend that comes back is noticed without anybody restarting anything", async () => {
+  let clock = 0;
+  let healthy = false;
+  let calls = 0;
+  const embed = withCircuitBreaker(
+    async () => {
+      calls++;
+      if (!healthy) throw timeoutError();
+      return new Float32Array([1, 0, 0]);
+    },
+    { now: () => clock, cooldownMs: 1000 }
+  );
+
+  await assert.rejects(embed("x"));                                  // opens
+  await assert.rejects(embed("x"), EmbeddingsUnavailableError);      // fails fast
+  assert.equal(calls, 1);
+
+  clock += 999;
+  await assert.rejects(embed("x"), EmbeddingsUnavailableError, "still cooling down");
+  assert.equal(calls, 1, "no probe before the cooldown is over");
+
+  clock += 2;
+  healthy = true;
+  const vec = await embed("x");
+  assert.equal(vec.length, 3, "one probe gets through and succeeds");
+  assert.equal(calls, 2);
+
+  // Closed again: a success resets the count, so the next failure starts over.
+  healthy = false;
+  await assert.rejects(embed("x"));
+  assert.equal(calls, 3, "the breaker is closed, so this one reached the backend");
+});
+
+test("recall degrades to lexical rather than failing when the breaker is open", async () => {
+  // The whole point: the caller stops waiting, it does not stop working.
+  const embed = withCircuitBreaker(async () => { throw timeoutError(); });
+  await assert.rejects(embed("warm up"));
+
+  const out = await searchLessons(
+    db,
+    { query: "sqlite vector similarity", limit: 5 },
+    { vector, embedder: embed }
+  );
+  assert.ok(out.rows.length > 0, "lexical retrievers still answer");
+  assert.equal(out.modeNote, "", "and the result is not advertised as hybrid");
+});
+
 // ── Distance, similarity, and the floor ─────────────────────────────────────
 
 test("every embedding is unit length, so distance means the same thing per model", async () => {
@@ -414,6 +503,64 @@ test("a distant passage is not named at all — nearest is not the same as near"
   assert.ok(
     !rows.map((r) => Number(r.id)).includes(id),
     "an unrelated lesson is not dragged in by being the least far away"
+  );
+});
+
+// ── Reporting thin evidence ─────────────────────────────────────────────────
+
+test("brain_recall says how much of the question a hit actually contains", async () => {
+  // FILTERING ON THIS WAS TRIED AND MEASURED WRONG: recall@5 fell 100% → 79.4%
+  // and 11.8% of questions began returning nothing, because a real question
+  // spreads across lessons that each answer part of it — a softer version of
+  // the implicit AND that made the base look empty in the first place. So the
+  // tool answers and labels the evidence instead.
+  const recall = toolByName("brain_recall");
+
+  const weak = textOf(await recall.handler({
+    query: "kubernetes istio mesh sidecar orchestration", limit: 3,
+  }));
+  if (/Found \d+ lessons/.test(weak)) {
+    assert.match(weak, /thin: \d+\/5 terms/, "each thin hit is labelled");
+    assert.match(weak, /may have nothing on this/, "and the set as a whole is flagged");
+  }
+
+  const strong = textOf(await recall.handler({ query: "sqlite vector similarity", limit: 3 }));
+  assert.match(strong, /Found \d+ lessons/);
+  assert.ok(!/may have nothing on this/.test(strong), "a real match carries no caution");
+});
+
+test("a cross-lingual hit is never called thin — it has no words to share", async () => {
+  // Coverage is not measured for a lesson the vector retriever carried.
+  // Measuring it would label every semantic match as weak evidence, which is
+  // the one thing embeddings were installed to make possible.
+  const out = await searchLessons(
+    db,
+    { query: "sqlite vector similarity", limit: 5 },
+    { vector, embedder: createEmbedder(cfg) }
+  );
+  for (const [id, retrievers] of out.matchedBy!) {
+    if (retrievers.includes("vector")) {
+      assert.equal(out.coverage.get(id), undefined, `#${id} carried by meaning, not words`);
+    }
+  }
+});
+
+test("changing the embedding model does not fail silently", async () => {
+  // Same shape as swapping nomic-embed-text (768) for bge-m3 (1024): every
+  // query stops matching, brain_status still says "enabled", and the lexical
+  // retrievers keep answering — so semantic search is off and nothing says so.
+  const errs: string[] = [];
+  const original = console.error;
+  console.error = (...a: unknown[]) => { errs.push(a.join(" ")); };
+  try {
+    const wrongDim = new Float32Array(DIM + 8);
+    assert.deepEqual(vector.knn(wrongDim, 5), [], "no results, necessarily");
+  } finally {
+    console.error = original;
+  }
+  assert.ok(
+    errs.some((e) => /INACTIVE/.test(e) && /brain_reindex/.test(e)),
+    `the mismatch is named and the fix given: ${errs.join(" | ")}`
   );
 });
 

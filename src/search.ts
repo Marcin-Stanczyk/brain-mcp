@@ -11,7 +11,7 @@
 
 import type Database from "better-sqlite3";
 import { rrfFuse, similarityFromDistance, type Embedder, type RankedList } from "./embeddings.js";
-import { planFtsQuery } from "./query.js";
+import { planFtsQuery, stemForPrefix } from "./query.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Ranking policy ──────────────────────────────────────────────────────────
@@ -64,6 +64,38 @@ export const SCOPE_GLOBAL_BOOST = 1.05;
  * five. Re-run `npm run eval` after changing the model: the number belongs to
  * the pair, not to either one.
  */
+/**
+ * How much of the question a hit actually contains — REPORTED, NOT ENFORCED.
+ *
+ * The prompt hook drops anything below this floor, and should: it speaks
+ * uninvited on every prompt, so silence is the right answer to weak evidence.
+ * Applying the same rule to the tool was tried and measured, and it is wrong
+ * there — recall@5 fell from 100% to 79.4% and 11.8% of questions started
+ * returning nothing at all. The reason is the bug this project began with: a
+ * real question spreads across several lessons that each answer part of it, and
+ * demanding that any one lesson carry most of the question is a softer version
+ * of the implicit AND that made the base look empty.
+ *
+ * So the tool answers, and says how thin the evidence is. A caller that asked
+ * deliberately, set a limit and can read the content is able to judge — what it
+ * cannot do is tell a strong match from the least-far row in the base when
+ * nothing distinguishes them on the page.
+ */
+export const MIN_COVERED_TERMS = 2;
+export const MIN_COVERAGE_RATIO = 0.6;
+export const MAX_COVERAGE_FLOOR = 3;
+
+/** Terms of `stems` that appear in `content`. Mirrors the prompt hook. */
+export function coverage(content: string, stems: readonly string[]): number {
+  const low = String(content ?? "").toLowerCase();
+  return stems.reduce((n, stem) => (low.includes(stem) ? n + 1 : n), 0);
+}
+
+/** The bar a lexical-only hit has to clear for a question of `n` terms. */
+export function coverageFloor(n: number): number {
+  return Math.min(MAX_COVERAGE_FLOOR, Math.max(MIN_COVERED_TERMS, Math.ceil(n * MIN_COVERAGE_RATIO)));
+}
+
 export const MIN_VECTOR_SIMILARITY = Number(process.env.BRAIN_MIN_SIMILARITY) || 0.5;
 
 export interface LessonRow {
@@ -115,6 +147,16 @@ export interface SearchOutcome {
   terms: string[];
   /** Human-readable note about which retrievers ran. */
   modeNote: string;
+  /**
+   * lesson id → how many of the question's terms it actually contains.
+   *
+   * Reported so a caller can tell a lesson about its question from the
+   * least-far row in the base. Absent for hits carried by the vector
+   * retriever, whose evidence is similarity rather than shared words.
+   */
+  coverage: Map<number, number>;
+  /** The bar below which lexical evidence counts as thin. */
+  coverageFloor: number;
 }
 
 const ROW_COLUMNS =
@@ -200,6 +242,8 @@ export async function searchLessons(
       bestChunk: new Map(),
       terms: [],
       modeNote: "",
+      coverage: new Map(),
+      coverageFloor: 0,
     };
   }
 
@@ -375,12 +419,24 @@ export async function searchLessons(
   );
 
   const top = boosted.slice(0, max);
+  const stems = plan.terms.map((t) => stemForPrefix(t));
+  const covered = new Map<number, number>();
+  for (const hit of top) {
+    // A hit the vector retriever carried is not measured in shared words —
+    // by construction a cross-lingual match has none.
+    if (hit.retrievers.includes("vector")) continue;
+    const row = rowById.get(hit.id);
+    if (row) covered.set(hit.id, coverage(String(row.content ?? ""), stems));
+  }
+
   return {
     rows: top.map((h) => rowById.get(h.id)).filter(Boolean) as LessonRow[],
     matchedBy: new Map(top.map((h) => [h.id, h.retrievers])),
     bestChunk,
     terms: plan.terms,
     modeNote,
+    coverage: covered,
+    coverageFloor: coverageFloor(stems.length),
   };
 }
 

@@ -367,6 +367,15 @@ Results are annotated with the retrievers that found them (`matched: all+any`),
 and the response names the terms actually searched for — including on a miss, so
 a query that quietly reduced to two words is distinguishable from an empty base.
 
+A hit carried only by shared words is also labelled with how many of them it
+shares (`thin: 1/5 terms`), and a result set where every hit is thin carries a
+caution. This is **reported, not enforced**: filtering on it was measured and
+recall@5 fell from 100% to 79.4% with an eighth of all questions returning
+nothing, because a real question spreads across lessons that each answer part of
+it — a softer version of the implicit AND that made the base look empty to begin
+with. The prompt hook, which speaks uninvited, does enforce it; the tool, which
+was asked deliberately and whose caller can read the content, does not.
+
 > **This is the fix for the bug that made brain-mcp look empty.** FTS5 joins bare
 > terms with an implicit AND, so `brain_recall` used to demand a single lesson
 > containing *every* word of the question. Asked
@@ -547,6 +556,31 @@ brain-mcp makes **zero** network calls out of the box. There is exactly **one** 
    - `important` — will save hours of work
    - `info` — useful, not critical
    - `tip` — nice to know
+
+### When the backend is not there
+
+Semantic search is additive: every failure path degrades to the lexical
+retrievers rather than to an error. What matters is that it degrades *quickly*.
+
+A refused connection fails in milliseconds. The case that costs is a backend
+which accepts the connection and never answers — a model loading under memory
+pressure, a laptop waking from sleep. Measured against a socket that accepts and
+hangs, every recall paid the full timeout and then returned exactly the
+lexical-only result it would have returned instantly: five questions, fifty
+seconds, nothing gained.
+
+So the embedder sits behind a circuit breaker. **A timeout counts double**,
+because it already spent the whole budget — one hang is enough to pause vector
+search, while a single cheap failure is forgiven as a blip. After a minute one
+probe is allowed through, so a backend that comes back is noticed without
+anybody restarting anything. Five questions against a hung backend now cost one
+timeout instead of five.
+
+Two other silent failures are made loud: a dimension mismatch after a model
+change (every query matches nothing while `brain_status` still says "enabled")
+names itself and tells you to run `brain_reindex force:true`, and `npm run
+doctor` pings the backend named in your MCP config rather than trusting that it
+is up.
 
 ### Tuning the similarity floor
 

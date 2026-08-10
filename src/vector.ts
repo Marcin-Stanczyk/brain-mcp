@@ -56,6 +56,8 @@ const META_MODEL = "vec_model";
 const VEC_TABLE = "chunks_vec";
 
 class SqliteVecIndex implements VectorIndex {
+  private warnedDim = false;
+
   constructor(private db: Database.Database) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS chunk_embeddings (
@@ -190,7 +192,22 @@ class SqliteVecIndex implements VectorIndex {
   knn(vec: Float32Array, k: number): KnnHit[] {
     if (!this.hasVecTable()) return [];
     const dim = this.dim();
-    if (dim !== null && dim !== vec.length) return []; // model changed — cannot compare
+    if (dim !== null && dim !== vec.length) {
+      // A SILENT ZERO IS THE WORST ANSWER HERE.
+      // Change the model and every query stops matching anything, while
+      // brain_status still reports "enabled" and the lexical retrievers keep
+      // answering — so semantic search is off and nothing says so. Warned once
+      // per process: the fix is a reindex, not a hundred identical lines.
+      if (!this.warnedDim) {
+        this.warnedDim = true;
+        console.error(
+          `⚠️ brain-mcp: vector index holds ${dim}-dimensional vectors but the ` +
+            `current model produces ${vec.length} — semantic search is INACTIVE. ` +
+            `Run brain_reindex with force:true to rebuild it.`
+        );
+      }
+      return [];
+    }
     return this.db
       .prepare(
         `SELECT chunk_id AS id, distance

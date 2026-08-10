@@ -112,6 +112,94 @@ export function createEmbedder(cfg: EmbeddingsConfig): Embedder {
   };
 }
 
+// ── Circuit breaker ─────────────────────────────────────────────────────────
+
+/** Consecutive failures before the breaker opens. */
+export const BREAKER_FAILURE_THRESHOLD = 2;
+
+/** How long it stays open before allowing one probe through. */
+export const BREAKER_COOLDOWN_MS = 60_000;
+
+/** Did this failure cost us the whole timeout budget? */
+function isTimeout(err: unknown): boolean {
+  const name = (err as { name?: string } | null)?.name ?? "";
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+export class EmbeddingsUnavailableError extends Error {
+  constructor(msRemaining: number) {
+    super(
+      `embeddings backend marked unavailable after repeated failures; ` +
+        `retrying in ${Math.ceil(msRemaining / 1000)}s`
+    );
+    this.name = "EmbeddingsUnavailableError";
+  }
+}
+
+/**
+ * Wrap an embedder so a dead backend costs ONE timeout, not one per question.
+ *
+ * A refused connection fails in milliseconds and needs no protection. The case
+ * that does is a backend which accepts the connection and never answers — a
+ * model loading under memory pressure, a laptop waking from sleep. Measured
+ * against a socket that accepts and hangs: every recall paid the full 10s
+ * timeout and then returned exactly the lexical-only result it would have
+ * returned instantly. Three questions, thirty seconds, nothing gained.
+ *
+ * After `threshold` consecutive failures the breaker opens and calls fail
+ * immediately; callers already degrade to lexical search, so the only change is
+ * that they stop waiting first. One probe is allowed through after the cooldown
+ * — a backend that comes back must be noticed without anybody restarting
+ * anything.
+ *
+ * Deliberately not a retry: retrying a hung endpoint multiplies the wait.
+ */
+export function withCircuitBreaker(
+  embed: Embedder,
+  {
+    threshold = BREAKER_FAILURE_THRESHOLD,
+    cooldownMs = BREAKER_COOLDOWN_MS,
+    now = () => Date.now(),
+    onOpen,
+  }: {
+    threshold?: number;
+    cooldownMs?: number;
+    now?: () => number;
+    onOpen?: (failures: number) => void;
+  } = {}
+): Embedder {
+  let failures = 0;
+  let openedAt: number | null = null;
+
+  return async (text: string): Promise<Float32Array> => {
+    if (openedAt !== null) {
+      const elapsed = now() - openedAt;
+      if (elapsed < cooldownMs) throw new EmbeddingsUnavailableError(cooldownMs - elapsed);
+      // Cooldown over: let exactly one call through to find out.
+      openedAt = null;
+    }
+    try {
+      const vec = await embed(text);
+      failures = 0;
+      return vec;
+    } catch (err) {
+      // A TIMEOUT COUNTS DOUBLE, BECAUSE IT COST DOUBLE.
+      // The breaker exists to stop paying for waiting, and the two failure
+      // shapes are not equally expensive: a refused connection returns in
+      // milliseconds and may well be a blip worth forgiving, while a timeout
+      // has already spent the full budget. Weighting by what the failure cost
+      // opens the breaker after ONE hang and still tolerates a single cheap
+      // stumble.
+      failures += isTimeout(err) ? threshold : 1;
+      if (failures >= threshold) {
+        openedAt = now();
+        onOpen?.(failures);
+      }
+      throw err;
+    }
+  };
+}
+
 /**
  * Scale a vector to unit length, in place.
  *

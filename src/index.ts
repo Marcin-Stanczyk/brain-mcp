@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { join, dirname } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
-import { embeddingsConfigFromEnv, createEmbedder } from "./embeddings.js";
+import { embeddingsConfigFromEnv, createEmbedder, withCircuitBreaker } from "./embeddings.js";
 import { loadVectorIndex } from "./vector.js";
 import { registerResources } from "./resources.js";
 import { reportStartupFailure } from "./preflight.js";
@@ -35,7 +35,16 @@ async function main() {
   // - sqlite-vec failing to load → FTS5-only mode, never a crash
   const embeddingsConfig = embeddingsConfigFromEnv();
   const vector = embeddingsConfig ? await loadVectorIndex(db) : null;
-  const embedder = embeddingsConfig ? createEmbedder(embeddingsConfig) : null;
+  // Wrapped so a backend that hangs costs one timeout for the session rather
+  // than one per question — see withCircuitBreaker.
+  const embedder = embeddingsConfig
+    ? withCircuitBreaker(createEmbedder(embeddingsConfig), {
+        onOpen: (failures) =>
+          console.error(
+            `⚠️ brain-mcp: embeddings backend failed ${failures}× in a row — pausing vector search for a minute, lexical retrievers continue.`
+          ),
+      })
+    : null;
 
   for (const tool of createTools(db, CODE_DIR, {
     dataDir: dirname(DB_PATH),

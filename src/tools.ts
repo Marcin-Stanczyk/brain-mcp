@@ -553,7 +553,8 @@ export function createTools(
       project?: string;
       limit?: number;
     }): Promise<TextResult> => {
-      const { rows: results, matchedBy, bestChunk, terms: searchedTerms, modeNote } =
+      const { rows: results, matchedBy, bestChunk, terms: searchedTerms, modeNote,
+              coverage: termCoverage, coverageFloor: thinBelow } =
         await searchLessons(
           db,
           { query, category, project, limit },
@@ -619,14 +620,38 @@ export function createTools(
           ? `${passage}\n   ⤷ matching passage of a ${content.length}-character lesson — full text: brain://lessons/${r.id}`
           : content;
 
-        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${body}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}`;
+        // HOW MUCH OF THE QUESTION THIS LESSON ACTUALLY CONTAINS.
+        // Filtering on it was tried and measured: recall@5 fell from 100% to
+        // 79% and an eighth of all questions started returning nothing, because
+        // a real question spreads across lessons that each answer part of it.
+        // So it is said rather than enforced — a caller who asked deliberately
+        // can judge, but only if the page distinguishes a lesson about the
+        // question from the least-far row in the base.
+        const cov = termCoverage.get(Number(r.id));
+        const thin = cov !== undefined && cov < thinBelow
+          ? ` | thin: ${cov}/${searchedTerms.length} terms`
+          : "";
+
+        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${body}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}${thin}`;
       }).join("\n\n---\n\n");
+
+      // When EVERY hit is thin the base probably has nothing on this, and the
+      // ranking cannot say so — it only orders what it found.
+      const allThin = searchedTerms.length > 0 && results.length > 0 &&
+        (results as Record<string, unknown>[]).every((r) => {
+          const c = termCoverage.get(Number(r.id));
+          return c !== undefined && c < thinBelow;
+        });
+      const caution = allThin
+        ? `\n⚠️ Every hit below matches only part of your question and none was found by meaning. ` +
+          `The base may have nothing on this — read before relying on it.\n`
+        : "";
 
       const termNote = searchedTerms.length ? ` for: ${searchedTerms.join(", ")}` : "";
       return {
         content: [{
           type: "text" as const,
-          text: `Found ${results.length} lessons${modeNote}${termNote}:\n\n${formatted}`,
+          text: `Found ${results.length} lessons${modeNote}${termNote}:${caution}\n\n${formatted}`,
         }],
       };
     },
