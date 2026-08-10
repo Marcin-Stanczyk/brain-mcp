@@ -131,19 +131,6 @@ if (!Database) {
 
 // ── sqlite-vec and embeddings ───────────────────────────────────────────────
 
-section("Semantic search (optional)");
-if (!process.env.BRAIN_EMBEDDINGS_URL) {
-  ok("off — lexical retrievers only (set BRAIN_EMBEDDINGS_URL to add it)");
-} else {
-  ok(`BRAIN_EMBEDDINGS_URL = ${process.env.BRAIN_EMBEDDINGS_URL}`);
-  try {
-    require.resolve("sqlite-vec");
-    ok("sqlite-vec is installed");
-  } catch {
-    bad("sqlite-vec is not installed, so vectors cannot be stored: npm install sqlite-vec");
-  }
-}
-
 // ── MCP client configuration ────────────────────────────────────────────────
 // This is where the two worst failures lived: a path that no longer existed,
 // and a bare `node` that resolved differently depending on the launching shell.
@@ -162,6 +149,8 @@ const configs = [
 ];
 
 let sawAnyEntry = false;
+/** env the MCP client will actually launch the server with. */
+const declaredEnv = {};
 for (const cfg of configs) {
   if (!existsSync(cfg.path)) continue;
   let servers;
@@ -175,6 +164,7 @@ for (const cfg of configs) {
     const args = server?.args ?? [];
     if (!args.some((a) => String(a).includes("brain-mcp"))) continue;
     sawAnyEntry = true;
+    Object.assign(declaredEnv, server?.env ?? {});
 
     const target = args.find((a) => String(a).endsWith(".js"));
     if (target && !existsSync(target)) {
@@ -200,6 +190,58 @@ for (const cfg of configs) {
   }
 }
 if (!sawAnyEntry) warn("no MCP client config mentions brain-mcp — the server is registered nowhere");
+
+// ── sqlite-vec and embeddings ───────────────────────────────────────────────
+// Read from the MCP CONFIG, not from this process's environment. The server is
+// launched by the client with the env declared there, so checking `process.env`
+// answers a question about the shell running the doctor and reports "off" for
+// an installation that is on.
+
+section("Semantic search (optional)");
+const declaredUrl = declaredEnv.BRAIN_EMBEDDINGS_URL || process.env.BRAIN_EMBEDDINGS_URL;
+const declaredModel = declaredEnv.BRAIN_EMBEDDINGS_MODEL || process.env.BRAIN_EMBEDDINGS_MODEL;
+if (!declaredUrl) {
+  ok("off — lexical retrievers only (set BRAIN_EMBEDDINGS_URL in your MCP config to add it)");
+} else {
+  ok(`${declaredUrl}${declaredModel ? ` — model ${declaredModel}` : ""}`);
+  try {
+    require.resolve("sqlite-vec");
+    ok("sqlite-vec is installed");
+  } catch {
+    bad("sqlite-vec is not installed, so vectors cannot be stored: npm install sqlite-vec");
+  }
+  // A backend named in the config and not answering is worse than one that was
+  // never configured: recall silently degrades to lexical and nothing says so.
+  try {
+    const res = await fetch(new URL("/api/version", declaredUrl), {
+      signal: AbortSignal.timeout(3000),
+    });
+    ok(`backend reachable (${(await res.json()).version ?? "ok"})`);
+  } catch (err) {
+    bad(
+      `backend at ${declaredUrl} is NOT reachable (${err?.message ?? err}).\n` +
+      "       Recall degrades to lexical-only without saying so. Start it, e.g.: brew services start ollama"
+    );
+  }
+
+  if (Database && existsSync(dbPath)) {
+    try {
+      const db = new Database(dbPath, { readonly: true });
+      const chunks = Object.values(db.prepare("SELECT COUNT(*) FROM lesson_chunks").get())[0];
+      const embedded = Object.values(
+        db.prepare("SELECT COUNT(*) FROM chunk_embeddings e JOIN lesson_chunks c ON c.id = e.chunk_id").get()
+      )[0];
+      if (embedded < chunks) {
+        warn(`${chunks - embedded} of ${chunks} passages have no vector — run brain_reindex`);
+      } else {
+        ok(`all ${chunks} passages embedded`);
+      }
+      db.close();
+    } catch {
+      warn("no vector bookkeeping yet — run brain_reindex once the server has started");
+    }
+  }
+}
 
 // ── Hooks ───────────────────────────────────────────────────────────────────
 
