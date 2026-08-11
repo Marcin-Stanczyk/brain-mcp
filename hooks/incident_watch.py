@@ -33,7 +33,19 @@ import re
 import sys
 import time
 
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _brain_db as bd  # noqa: E402
+
+# ONE DEFINITION, AND THIS FILE HELD THE SECOND ONE.
+# `_brain_db.STATE_DIR` honours $BRAIN_STATE_DIR precisely so the tests can run
+# against a throwaway directory; its own comment says that without the override
+# "the suite would read and write the state of whatever real session is open".
+# This hook hardcoded the path instead, so it did exactly that: every run of the
+# test suite appended genuine incident records to the developer's live journal.
+# Found by reading it — 37 of 102 recorded reverts turned out to be one line of
+# test fixture, `cp /tmp/settings.json.bak-1 ~/.claude/settings.json`, replayed
+# once per test run over three days.
+STATE_DIR = bd.STATE_DIR
 
 # High-precision undo signals. Each entry: (label, regex, what it usually means)
 REVERT_PATTERNS = [

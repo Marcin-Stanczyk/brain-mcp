@@ -17,6 +17,7 @@ a suite that needed `pytest` would not be run on a machine where the hooks are
 misbehaving.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -672,6 +673,49 @@ class TestCaptureLesson(HookCase):
 # ---------------------------------------------------------------------------
 # incident_watch
 # ---------------------------------------------------------------------------
+class TestHooksWriteWhereTheyAreTold(HookCase):
+    """No hook may write to the real state directory when told otherwise.
+
+    `_brain_db.STATE_DIR` honours $BRAIN_STATE_DIR for exactly this reason, and
+    its comment says why: without it "the suite would read and write the state
+    of whatever real session is open". incident_watch.py kept a second,
+    hardcoded copy of the path and did precisely that — 37 of the 102 reverts in
+    the developer's live journal turned out to be one line of this file,
+    replayed once per test run over three days. Two copies of anything
+    load-bearing drift, and this drift was silent because the tests still passed.
+    """
+
+    lessons = []
+
+    def test_no_hook_defines_its_own_state_directory(self):
+        import glob
+        for path in glob.glob(os.path.join(HOOKS, "*.py")):
+            src = open(path, encoding="utf-8").read()
+            if os.path.basename(path) == "_brain_db.py":
+                self.assertIn("BRAIN_STATE_DIR", src, "the one definition reads the override")
+                continue
+            self.assertNotIn(
+                'os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")',
+                src,
+                f"{os.path.basename(path)} builds the state path itself instead of using _brain_db",
+            )
+
+    def test_an_incident_lands_in_the_directory_the_env_names(self):
+        real = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "brain", "state")
+        before = set(glob.glob(os.path.join(real, "leak-probe*"))) if os.path.isdir(real) else set()
+
+        self.run_hook("incident_watch.py", {
+            "session_id": "leak-probe",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git checkout -- some/file.php"},
+        })
+
+        wrote = glob.glob(os.path.join(self.state, "leak-probe*"))
+        self.assertTrue(wrote, "the incident was journalled into the temp directory")
+        after = set(glob.glob(os.path.join(real, "leak-probe*"))) if os.path.isdir(real) else set()
+        self.assertEqual(before, after, "and nothing was written to the real one")
+
+
 class TestIncidentWatch(HookCase):
     lessons = []
 
