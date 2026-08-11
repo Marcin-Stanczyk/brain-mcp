@@ -80,8 +80,20 @@ MIN_TERMS = 2
 # descending into the ranking — by the fifth prompt they were the 13th to 15th
 # best, still at full price. A floor turns that into silence, which is the
 # correct answer to "I have already told you everything I know about this".
-MIN_COVERED_TERMS = 2
-MIN_COVERAGE_RATIO = 0.6
+# 0.4, NOT THE 0.6 THIS SHIPPED WITH. The first value was chosen by reading a
+# handful of prompts; swept against the 21 judged queries it turned out to be
+# silencing three of them outright, including "wp eval koszty zamówień backfill
+# lipiec" — the question this whole project began with. Measured on the fixture:
+#
+#   ratio 0.6   recall@3 89.5%   precision@1 84.2%   MRR 0.868
+#   ratio 0.4   recall@3 95.6%   precision@1  100%   MRR 1.000
+#
+# and on the real base the hook fires on the same 8 prompts in 10 either way, at
+# the same token cost. Tightening the floor bought no silence; it only lost
+# answers. Which is worth saying plainly: the remaining noise does NOT come from
+# this knob, so turning it up is not the fix for it.
+MIN_COVERED_TERMS = int(os.environ.get("BRAIN_MIN_COVERED", "2"))
+MIN_COVERAGE_RATIO = float(os.environ.get("BRAIN_COVERAGE_RATIO", "0.4"))
 
 # Weights for merging the lexical ordering with the semantic one, mirroring
 # RETRIEVER_WEIGHTS in src/search.ts. Lexical leads because it is precise about
@@ -113,7 +125,7 @@ LEX_DEPTH = int(os.environ.get("BRAIN_LEX_DEPTH", "8"))
 # would demand six shared terms, which no lesson has, so the hook would fall
 # silent exactly when the user finally gave it plenty to work with. Three shared
 # terms is strong evidence however long the question is.
-MAX_COVERAGE_FLOOR = 3
+MAX_COVERAGE_FLOOR = int(os.environ.get("BRAIN_MAX_COVERAGE_FLOOR", "3"))
 
 
 def project_name(cwd):

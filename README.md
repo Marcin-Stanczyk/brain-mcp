@@ -69,6 +69,8 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `scripts/doctor.mjs` | `npm run doctor` — checks node ABI, build, indexes, MCP config, hooks |
 | `scripts/eval.mjs` | `npm run eval` — retrieval quality report against the judged query set |
 | `scripts/sweep.mjs` | `npm run eval:sweep` — derives the vector similarity floor by measuring it |
+| `hooks/_brain_vec.py` | Semantic search for the hooks — embeddings, vec0, a file-backed breaker |
+| `tests/eval/hook_eval.py` | `npm run eval:hook` — the hook's ranking, on the tool's judged queries |
 | `tests/eval/` | Committed fixture corpus + judged queries, with CI thresholds |
 | `tests/*.test.ts` | Test suites (`node:test`, temp DBs, fixture dirs, mocked embeddings HTTP) |
 | `dist/index.js` | Compiled JS (what your MCP client runs) |
@@ -635,6 +637,14 @@ It is read-only — it prints what is wrong and what to run.
 queries, including ones that must return **nothing**. The same thresholds run in
 `npm test`, so a ranking regression fails the build instead of being discovered
 months later by someone concluding the knowledge base is empty.
+
+`npm run eval:hook` scores the **prompt hook** against the same judged queries.
+It has its own ranking — a separate Python implementation — and for a long time
+it had no thresholds at all, which is backwards: it fires on every sentence and
+decides what an agent reads before it starts, while the tool waits to be asked.
+The gap cost two real defects that only measurement found. Metrics are @3
+because the hook shows three lessons; recall past the third slot describes a
+list nobody sees.
 
 ```
 lexical-answerable — 19 queries

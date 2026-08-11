@@ -674,6 +674,67 @@ class TestCaptureLesson(HookCase):
 # ---------------------------------------------------------------------------
 # incident_watch
 # ---------------------------------------------------------------------------
+class TestHookRetrievalQuality(unittest.TestCase):
+    """Thresholds for the hook's ranking, on the tool's own judged queries.
+
+    `brain_recall` has had these in CI since its ranking was first measured. The
+    hook — which fires on every sentence and decides what an agent reads before
+    it starts — had none, and the gap cost something concrete twice: a fusion
+    that weighted the lexical arm across its full sixty-row list so vectors
+    changed NOTHING, and a coverage floor picked by reading a few prompts that
+    turned out to silence three judged queries, one of them the question this
+    project began with.
+
+    Scored WITHOUT a backend on purpose. CI has no Ollama, and the floor has to
+    describe what the hook manages on its own; the semantic arm is measured
+    separately by `npm run eval:hook` with a backend configured.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "tests", "eval"))
+        # An unreachable port rather than an unset variable: _brain_vec falls
+        # back to the MCP client's own config, which on a developer machine
+        # does have a backend, and the numbers would then depend on whose
+        # laptop ran the suite.
+        os.environ["BRAIN_EMBEDDINGS_URL"] = "http://127.0.0.1:59996"
+        os.environ.pop("BRAIN_DB", None)
+        for mod in ("relevant_lessons", "_brain_db", "_brain_vec", "hook_eval"):
+            sys.modules.pop(mod, None)
+        import hook_eval
+        cls.report, cls.failures, cls.tmp = hook_eval.run()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+        os.environ.pop("BRAIN_EMBEDDINGS_URL", None)
+
+    def _context(self):
+        return "\n".join(
+            f"  ✗ «{q}» chciano {w} dostano {g[:3]}" for q, w, g in self.failures
+        )
+
+    def test_most_judged_questions_are_answered_in_the_three_slots(self):
+        # Measured 87.7% lexical-only. The hook shows three lessons, so recall
+        # past the third slot describes a list nobody sees.
+        self.assertGreaterEqual(self.report["recall@3"], 0.82,
+                                f"recall@3 fell\n{self._context()}")
+
+    def test_the_first_slot_is_usually_right(self):
+        self.assertGreaterEqual(self.report["precision@1"], 0.80,
+                                f"precision@1 fell\n{self._context()}")
+        self.assertGreaterEqual(self.report["mrr"], 0.82,
+                                f"MRR fell\n{self._context()}")
+
+    def test_a_question_the_base_cannot_answer_gets_silence(self):
+        # The hook speaks uninvited; an irrelevant hit is what teaches somebody
+        # to stop reading. This is the one threshold with no slack in it.
+        self.assertEqual(1.0, self.report["true_negatives"],
+                         f"the hook answered a question it should have ignored\n{self._context()}")
+
+
 class TestHookSemanticSearch(unittest.TestCase):
     """The automatic path had no semantics, and that was backwards.
 
