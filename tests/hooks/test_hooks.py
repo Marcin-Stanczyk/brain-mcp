@@ -673,6 +673,44 @@ class TestCaptureLesson(HookCase):
 # ---------------------------------------------------------------------------
 # incident_watch
 # ---------------------------------------------------------------------------
+class TestRestoreIntoTempIsNotAnIncident(unittest.TestCase):
+    """A restore that only touches /tmp undoes nothing worth a lesson.
+
+    The watcher exists to catch a mistake that was noticed and worked around. A
+    mutation-testing loop resets its scratch copy dozens of times — the shape of
+    a restore, the substance of a for-loop. Measured on the live journal: of the
+    three detections since the positional fix landed, two were exactly this.
+    """
+
+    def setUp(self):
+        import incident_watch
+        self.iw = incident_watch
+
+    def test_a_scratch_restore_is_ignored(self):
+        for cmd in [
+            "cp /tmp/k.bak /tmp/mut.php",
+            "cp /private/tmp/claude-501/abc/scratchpad/x.orig.php /private/tmp/claude-501/abc/mut.php",
+            "cd /repo && cp /tmp/s2.bak /tmp/mut.php && php -l /tmp/mut.php",
+        ]:
+            self.assertFalse(self.iw.restored_from_backup(cmd), cmd)
+
+    def test_a_restore_into_the_working_tree_still_counts(self):
+        for cmd in [
+            "cp /tmp/k.bak wordpress/wp-content/mu-plugins/kamar-komentarze.php",
+            "cd /repo && cp /private/tmp/scratch/sku.orig.php wp/plug.php && shasum -a 256 wp/plug.php",
+        ]:
+            self.assertTrue(self.iw.restored_from_backup(cmd), cmd)
+
+    def test_making_a_backup_is_still_not_restoring_one(self):
+        # The rule this was built on top of, retained: the destination being a
+        # temp path must not be the ONLY thing keeping a backup from counting.
+        for cmd in [
+            "cp wordpress/mu-plugins/oz.php /tmp/oz.bak && python3 -c 'x=1'",
+            'cd /x && P=wp/plug.php && cp "$P" /private/tmp/scratchpad/sku.orig.php',
+        ]:
+            self.assertFalse(self.iw.restored_from_backup(cmd), cmd)
+
+
 class TestHooksWriteWhereTheyAreTold(HookCase):
     """No hook may write to the real state directory when told otherwise.
 

@@ -96,6 +96,11 @@ _ASSIGN = re.compile(r"^\w+=")
 _COPIERS = ("cp", "mv", "rsync", "install")
 
 
+# Destinations nobody keeps work in. A restore landing here cannot be undoing
+# anything somebody would want a lesson about.
+_TEMP_DEST = re.compile(r"^(?:/private)?/tmp/|^/var/folders/")
+
+
 def restored_from_backup(cmd: str) -> bool:
     """True only when a .bak/.backup/.orig path is a SOURCE of a copy."""
     # Command substitutions go first: `$(date +%s)` splits into tokens that
@@ -111,8 +116,18 @@ def restored_from_backup(cmd: str) -> bool:
         operands = [t for t in tokens[i + 1:] if not t.startswith("-")]
         if len(operands) < 2:
             continue
-        if any(_BACKUP_SUFFIX.search(o) for o in operands[:-1]):
-            return True
+        if not any(_BACKUP_SUFFIX.search(o) for o in operands[:-1]):
+            continue
+        # RESTORING A FILE THAT ONLY LIVES IN /tmp UNDOES NOTHING.
+        # The watcher exists to catch a mistake that was noticed and worked
+        # around. A mutation-testing loop resets its scratch copy dozens of
+        # times — `cp /tmp/k.bak /tmp/mut.php` — which is the shape of a restore
+        # and the substance of a for-loop. Measured on the live journal: of the
+        # three detections since the positional fix landed, two were exactly
+        # this and one was a genuine restore into the working tree.
+        if _TEMP_DEST.match(operands[-1].strip('"\'')):
+            continue
+        return True
     return False
 
 
