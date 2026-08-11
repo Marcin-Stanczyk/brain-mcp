@@ -41,6 +41,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _brain_db as bd  # noqa: E402
+import _brain_vec as bv  # noqa: E402
 
 # Deliberately small. Three relevant lessons get read; ten get skimmed.
 MAX_LESSONS = int(os.environ.get("BRAIN_PROMPT_MAX_LESSONS", "3"))
@@ -81,6 +82,33 @@ MIN_TERMS = 2
 # correct answer to "I have already told you everything I know about this".
 MIN_COVERED_TERMS = 2
 MIN_COVERAGE_RATIO = 0.6
+
+# Weights for merging the lexical ordering with the semantic one, mirroring
+# RETRIEVER_WEIGHTS in src/search.ts. Lexical leads because it is precise about
+# the words actually used; the vector arm exists to reach the lessons that share
+# meaning and no vocabulary at all.
+RRF_K = 60
+
+# THE VECTOR ARM OUTWEIGHS THE LEXICAL ONE, WHICH LOOKS BACKWARDS AND IS NOT.
+# It has already passed a bar: only passages above MIN_SIMILARITY reach the
+# fusion at all. The lexical list is unfiltered and up to sixty rows deep, and
+# its tail is close to noise. The first attempt weighted lexical higher over the
+# full list and the result was that vectors changed NOTHING — the head of a
+# 60-row list at weight 2.0 outscores the best possible vector hit at 1.5, so
+# every slot was already taken before the semantic arm was consulted.
+W_LEXICAL = float(os.environ.get("BRAIN_W_LEXICAL", "1.5"))
+W_VECTOR = float(os.environ.get("BRAIN_W_VECTOR", "2.0"))
+
+# Only the head of the lexical ranking competes, for the same reason. Roughly
+# three times MAX_LESSONS: enough candidates to fill the slots, few enough that
+# the tail cannot crowd out semantic evidence. Below this the fusion is
+# unaffected when no backend is configured — the top three of the top eight are
+# the top three.
+#
+# CALIBRATED ON THREE JUDGED QUESTIONS, WHICH IS THIN. Depth 6 scored marginally
+# better and 8 is the more conservative pick; redo it properly against a real
+# judged set before treating either number as load-bearing.
+LEX_DEPTH = int(os.environ.get("BRAIN_LEX_DEPTH", "8"))
 # ...but capped, because a ratio alone scales the wrong way. A ten-word question
 # would demand six shared terms, which no lesson has, so the hook would fall
 # silent exactly when the user finally gave it plenty to work with. Three shared
@@ -154,6 +182,25 @@ def record_shown(session_id, ids):
             pass
 
 
+def _fuse(scored, vector_hits):
+    """Merge the lexical ordering with the semantic one by reciprocal rank.
+
+    Unweighted RRF would give both lists' top hit the same score, which is wrong
+    when they differ in precision — the lexical arm knows which words were
+    actually used. Ties break towards the lexical order, which is deterministic.
+    """
+    lexical_order = [r[1] for r in scored if r[0] != 0.0][:LEX_DEPTH]
+    points = {}
+    for rank, lid in enumerate(lexical_order):
+        points[lid] = points.get(lid, 0.0) + W_LEXICAL / (RRF_K + rank + 1)
+    for rank, (lid, _sim, _chunk) in enumerate(vector_hits[:LEX_DEPTH]):
+        points[lid] = points.get(lid, 0.0) + W_VECTOR / (RRF_K + rank + 1)
+
+    by_id = {r[1]: r for r in scored}
+    ordered = sorted(points, key=lambda lid: (-points[lid], by_id[lid][0] if lid in by_id else 0))
+    return [by_id[lid] for lid in ordered if lid in by_id]
+
+
 def search(prompt, project, exclude):
     """Rank lessons by relevance to the prompt, across every project."""
     if len(bd.fts_terms(prompt)) < MIN_TERMS:
@@ -222,7 +269,42 @@ def search(prompt, project, exclude):
         scored.append((score, lid, cat, content, sev, proj))
 
     scored.sort(key=lambda r: r[0])
-    top = scored[:MAX_LESSONS]
+
+    # SEMANTIC EVIDENCE, WHICH THE COVERAGE FLOOR ABOVE CANNOT SEE.
+    # An English question about a Polish lesson shares meaning and, by
+    # construction, no terms — so vector hits are collected separately and are
+    # never subject to the floor. Silence when the backend is unreachable: the
+    # lexical ordering is already complete.
+    vector_hits = []
+    con = bd.connect(readonly=True)
+    if con is not None:
+        try:
+            vec = bv.embed(prompt)
+            if vec:
+                by_id = {r[1]: r for r in scored}
+                for lid, sim, chunk in sorted(
+                    bv.nearest_passages(con, vec, k=30), key=lambda r: -r[1]
+                ):
+                    if lid in exclude:
+                        continue
+                    if lid in by_id:
+                        vector_hits.append((lid, sim, chunk))
+                        continue
+                    row = con.execute(
+                        "SELECT id, category, content, severity, project FROM lessons WHERE id = ?",
+                        (lid,),
+                    ).fetchone()
+                    if row:
+                        # score 0.0: it plays no part in the lexical ordering,
+                        # only in the fusion below.
+                        scored.append((0.0, row[0], row[1], row[2], row[3], row[4]))
+                        vector_hits.append((lid, sim, chunk))
+        except Exception:
+            vector_hits = []
+        finally:
+            con.close()
+
+    top = _fuse(scored, vector_hits)[:MAX_LESSONS]
 
     # Replace the head of each long lesson with the passage that matched. A
     # second, cheap query rather than a join: only a handful of lessons survive
@@ -236,6 +318,10 @@ def search(prompt, project, exclude):
             chunks = {}
         finally:
             con.close()
+        # A lesson found by meaning has no shared words for best_chunks to rank,
+        # so the passage the vector arm matched is the only one that makes sense.
+        for lid, _sim, chunk in vector_hits:
+            chunks.setdefault(lid, chunk)
         top = [row + (chunks.get(row[1]),) for row in top]
     else:
         top = [row + (None,) for row in top]

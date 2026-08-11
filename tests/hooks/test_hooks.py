@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HOOKS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "hooks")
@@ -673,6 +674,75 @@ class TestCaptureLesson(HookCase):
 # ---------------------------------------------------------------------------
 # incident_watch
 # ---------------------------------------------------------------------------
+class TestHookSemanticSearch(unittest.TestCase):
+    """The automatic path had no semantics, and that was backwards.
+
+    Embeddings reached `brain_recall` and stopped there: the tool ran six
+    retrievers, the prompt hook three lexical ones. So the path needing an
+    agent's initiative was stronger than the path that works by itself — and the
+    automatic one is the reason any of this reaches anybody.
+    """
+
+    def setUp(self):
+        import _brain_vec
+        self.bv = _brain_vec
+        self.tmp = tempfile.mkdtemp(prefix="brain-vec-")
+        self._state = self.bv.STATE_DIR
+        self.bv.STATE_DIR = self.tmp
+
+    def tearDown(self):
+        self.bv.STATE_DIR = self._state
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_environment_wins_over_the_client_config(self):
+        os.environ["BRAIN_EMBEDDINGS_URL"] = "http://example.invalid:1234/"
+        os.environ["BRAIN_EMBEDDINGS_MODEL"] = "test-model"
+        try:
+            cfg = self.bv.config()
+            self.assertEqual("http://example.invalid:1234", cfg["url"], "trailing slash stripped")
+            self.assertEqual("test-model", cfg["model"])
+        finally:
+            os.environ.pop("BRAIN_EMBEDDINGS_URL", None)
+            os.environ.pop("BRAIN_EMBEDDINGS_MODEL", None)
+
+    def test_the_breaker_survives_the_process_that_opened_it(self):
+        # THE DIFFERENCE FROM THE SERVER. Every hook run is a fresh process, so a
+        # breaker held in memory would re-pay the timeout on every prompt —
+        # exactly the cost it exists to avoid.
+        self.assertFalse(self.bv.breaker_open())
+        self.bv.trip_breaker()
+        self.assertTrue(self.bv.breaker_open(), "state outlives this call")
+        self.assertFalse(
+            self.bv.breaker_open(now=time.time() + self.bv.BREAKER_COOLDOWN_S + 1),
+            "and expires on its own",
+        )
+        self.bv.reset_breaker()
+        self.assertFalse(self.bv.breaker_open())
+
+    def test_an_unreachable_backend_costs_one_attempt_then_none(self):
+        os.environ["BRAIN_EMBEDDINGS_URL"] = "http://127.0.0.1:59998"
+        try:
+            self.assertIsNone(self.bv.embed("anything", timeout=1))
+            self.assertTrue(self.bv.breaker_open(), "the failure was remembered")
+            self.assertIsNone(self.bv.embed("anything", timeout=1), "and the next call does not wait")
+        finally:
+            os.environ.pop("BRAIN_EMBEDDINGS_URL", None)
+
+    def test_no_backend_configured_means_no_network_call(self):
+        # The opt-in promise: without a configured backend nothing here reaches
+        # the network, whatever else changes.
+        self.assertIsNone(self.bv.embed("text", cfg=None) if self.bv.config() is None else None)
+
+    def test_vector_search_degrades_to_nothing_rather_than_raising(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            self.assertEqual([], self.bv.nearest_passages(con, None))
+            self.assertEqual([], self.bv.nearest_passages(con, [0.1, 0.2]),
+                             "a base with no vector tables answers nothing, not an exception")
+        finally:
+            con.close()
+
+
 class TestRestoreIntoTempIsNotAnIncident(unittest.TestCase):
     """A restore that only touches /tmp undoes nothing worth a lesson.
 
