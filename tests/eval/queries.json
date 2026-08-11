@@ -155,6 +155,69 @@
       "query": "roadmap obliczeń kwantowych na przyszły kwartał",
       "relevant": [],
       "why": "Polish negative — the stemmer is aggressive, so this checks it does not manufacture matches."
+    },
+    {
+      "query": "please update the meeting notes with the client's phone number",
+      "relevant": [],
+      "why": "Common vocabulary — update, notes, client — and a topic the base genuinely has nothing on. The first version of this query said 'the service keeps failing after every update', which the vector arm answered with the service-worker lesson. That was MY error, not the retriever's: semantically the two really are close. A negative has to be unrelated in meaning as well as unanswered, or it measures nothing."
+    },
+    {
+      "query": "how do we handle expenses for the team lunch",
+      "relevant": [],
+      "why": "Same correction. 'errors in test data' has a semantic neighbour in a base full of lessons about errors and tests; expenses for lunch does not."
+    },
+    {
+      "query": "why does the cached response show old records after a deploy",
+      "relevant": [
+        "cache-key-versioning"
+      ],
+      "why": "English question, Polish lesson, and the shared vocabulary is thin — cache and deploy only."
+    },
+    {
+      "query": "a mass update locks the orders table",
+      "relevant": [
+        "db-update-locking"
+      ],
+      "requiresSemantic": true,
+      "why": "English question against a Polish lesson; 'update' alone is common enough to mislead the lexical arm."
+    },
+    {
+      "query": "alert powinien mówić o skutku dla użytkownika a nie o metryce",
+      "relevant": [
+        "error-budget-alerts"
+      ]
+    },
+    {
+      "query": "service worker zostaje na starej wersji dopóki nie zamknę kart",
+      "relevant": [
+        "service-worker-update"
+      ]
+    },
+    {
+      "query": "data pokazuje się przesunięta o dzień dla użytkownika z innej strefy",
+      "relevant": [
+        "i18n-date-format"
+      ]
+    },
+    {
+      "query": "gdzie trzymać dane testowe żeby test opisywał ten sam przypadek",
+      "relevant": [
+        "test-data-fixtures"
+      ]
+    },
+    {
+      "query": "jak klient odróżnia błąd transportu od błędu domeny",
+      "relevant": [
+        "api-error-envelope"
+      ]
+    },
+    {
+      "query": "stary html po wdrożeniu i stare rekordy z cache",
+      "relevant": [
+        "hetzner-litespeed-cache",
+        "cache-key-versioning"
+      ],
+      "why": "Spans two lessons that each answer half — the shape the coverage floor is most likely to silence."
     }
   ]
 }

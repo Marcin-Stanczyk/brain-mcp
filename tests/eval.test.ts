@@ -35,9 +35,15 @@ const context = (label: string) =>
   `${label}\n\n${formatReport(result.lexical, "lexical-answerable")}\n\n${explainFailures(result.scored)}`;
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
-// Set just below the measured baseline (2026-08-08: recall@5 100%, precision@1
-// 82.4%, MRR 0.887). Tight enough that a real regression trips them, loose
-// enough that adding one hard query to the set does not.
+// Set just below the measured lexical-only baseline. Re-derived on 2026-08-11
+// after the judged set grew from 21 to 31 queries: recall@5 100% on the
+// lexically-answerable slice, precision@1 62.5%, MRR 0.770 — precision fell
+// because the queries added are harder, not because ranking regressed (with
+// vectors the same set scores precision@1 96.3%, MRR 0.975).
+//
+// CI runs without an embeddings backend, so these describe what the lexical
+// retrievers manage alone. tests/eval/hook_eval.py holds the same line for the
+// prompt hook, which has its own ranking and went far longer without one.
 
 test("every question lexical search can answer is answered in the top 5", () => {
   assert.ok(
@@ -54,12 +60,12 @@ test("no lexically-answerable question comes back empty", () => {
 
 test("the top hit is usually the right one", () => {
   assert.ok(
-    result.lexical.precisionAt1 >= 0.75,
-    context(`precision@1 fell to ${(result.lexical.precisionAt1 * 100).toFixed(1)}% (floor 75%)`)
+    result.lexical.precisionAt1 >= 0.55,
+    context(`precision@1 fell to ${(result.lexical.precisionAt1 * 100).toFixed(1)}% (floor 55%)`)
   );
   assert.ok(
-    result.lexical.mrr >= 0.85,
-    context(`MRR fell to ${result.lexical.mrr.toFixed(3)} (floor 0.85)`)
+    result.lexical.mrr >= 0.72,
+    context(`MRR fell to ${result.lexical.mrr.toFixed(3)} (floor 0.72)`)
   );
 });
 
@@ -96,8 +102,19 @@ test("the judged set stays honest", () => {
   // A set with no negatives measures only eagerness. A set with no positives
   // measures only silence. Both are easy to score well on and neither means
   // anything, so the shape of the set is asserted, not just its contents.
-  assert.ok(queries.filter((q) => q.relevant.length === 0).length >= 2, "negatives present");
-  assert.ok(queries.filter((q) => q.relevant.length > 0).length >= 15, "enough positives to average");
+  assert.ok(queries.filter((q) => q.relevant.length === 0).length >= 4, "negatives present");
+  assert.ok(queries.filter((q) => q.relevant.length > 0).length >= 25, "enough positives to average");
+  // At least one negative built from words that are common ACROSS the corpus.
+  // Without those the set cannot see the junk shape measured on the live base —
+  // a question about Kubernetes answered with a booking widget because
+  // "service" is ordinary. Two were added and both were initially WRONG: their
+  // topics had semantic neighbours, so the vector arm answered them correctly
+  // and the set called it a failure. A negative has to be unrelated in meaning
+  // as well as unanswered.
+  assert.ok(
+    queries.some((q) => q.relevant.length === 0 && /update|client|team/.test(q.query)),
+    "a negative built from ordinary vocabulary"
+  );
   assert.ok(
     queries.some((q) => q.project),
     "at least one query exercises a filter"

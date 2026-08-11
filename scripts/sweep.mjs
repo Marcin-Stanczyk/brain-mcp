@@ -10,12 +10,13 @@
 //
 // Read the table for a plateau, not a peak: a threshold sitting on the edge of
 // a cliff is overfitted to 21 queries. Measured on 2026-08-10 the plateau ran
-// 0.45–0.52, which is why the default is 0.5.
+// 0.45–0.52 on 21 queries; re-derived on 31 after the set grew.
+import { buildEmbeddedFixture } from "../tests/eval/harness.ts";
 import { rmSync } from "fs";
 const f = await buildEmbeddedFixture();
 if (!f) { console.log("brak backendu"); process.exit(1); }
 console.log("próg   recall@5  prec@1   MRR    true-neg   (lexical-answerable / all)");
-for (const t of [0.35, 0.40, 0.45, 0.48, 0.50, 0.52, 0.55, 0.58]) {
+for (const t of [0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]) {
   process.env.BRAIN_MIN_SIMILARITY = String(t);
   // re-import search with the new threshold
   const { searchLessons, severityBoosts } = await import(`../src/search.ts?t=${t}`);

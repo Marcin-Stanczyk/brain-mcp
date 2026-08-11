@@ -647,13 +647,22 @@ because the hook shows three lessons; recall past the third slot describes a
 list nobody sees.
 
 ```
-lexical-answerable — 19 queries
-  recall@5        100.0%
-  precision@1      82.4%
-  MRR               0.897
-  zero-result       0.0%
-  true negatives  100.0%
+                     lexical only        + bge-m3
+brain_recall     recall@5  94.4%      recall@5  100.0%
+                 precision@1 59.3%    precision@1 96.3%
+                 MRR        0.740     MRR        0.975
+brain hook       recall@3  84.0%      recall@3   96.9%
+                 precision@1 85.2%    precision@1 100.0%
+                 MRR        0.864     MRR        1.000
+both             true negatives 100%  true negatives 100%
 ```
+
+31 judged queries, four of which must return **nothing** — and two of those are
+built from vocabulary that is ordinary across the corpus, because that is the
+junk shape a small fixture otherwise cannot see. Both were wrong on the first
+attempt: their topics had semantic neighbours, so the vector arm answered them
+correctly and the set scored it as a failure. A negative has to be unrelated in
+meaning, not merely unanswered.
 
 Two of the 21 queries are marked `requiresSemantic`: an English question against
 a Polish lesson shares meaning and no words at all, and no amount of lexical

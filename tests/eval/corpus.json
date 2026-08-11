@@ -9,7 +9,9 @@
     "tool, one lesson long enough to be penalised by bm25 length normalisation, and",
     "distractors that share vocabulary with the queries without answering them.",
     "",
-    "`key` is the stable identity. Never renumber; add to the end."
+    "`key` is the stable identity. Never renumber; add to the end.",
+    "",
+    "The second block below exists to make the fixture behave like a real base in one specific way: common words ('service', 'data', 'test', 'error', 'update') spread across unrelated lessons. Without them a negative query cannot be built from ordinary vocabulary, and the one junk case measured on the live 354-lesson base — a question about Kubernetes answered with a booking widget, because 'service' is common — was invisible here."
   ],
   "lessons": [
     {
@@ -230,6 +232,62 @@
       "project": "kamar",
       "severity": "important",
       "content": "Hooki kasy WooCommerce odpalają się w kolejności priorytetów, a nie w kolejności rejestracji. Dwie wtyczki dopinające się do tego samego zdarzenia potrafią się nawzajem nadpisać w sposób zależny od kolejności ładowania."
+    },
+    {
+      "key": "gbp-review-replies",
+      "category": "marketing",
+      "project": "vs-beauty",
+      "severity": "info",
+      "content": "Odpowiadanie na opinie w profilu firmy podnosi widoczność w mapach. Szablonowa odpowiedź działa gorzej niż krótka konkretna — service quality wspomniany wprost w odpowiedzi wraca w cytatach."
+    },
+    {
+      "key": "api-error-envelope",
+      "category": "architecture",
+      "project": "kanarix-app",
+      "severity": "info",
+      "content": "Każda odpowiedź API niesie kopertę ze statusem i polem error. Klient rozróżnia błąd transportu od błędu domeny wyłącznie po tym polu, nie po kodzie HTTP."
+    },
+    {
+      "key": "test-data-fixtures",
+      "category": "testing",
+      "project": "kanarix-app",
+      "severity": "info",
+      "content": "Fixtures z danymi testowymi trzymamy w jednym pliku na moduł. Test, który buduje własne dane w locie, przestaje opisywać ten sam przypadek po pierwszej zmianie schematu."
+    },
+    {
+      "key": "service-worker-update",
+      "category": "bug-fix",
+      "project": "kanarix",
+      "severity": "important",
+      "content": "Service worker nie aktualizuje się, dopóki wszystkie karty nie zostaną zamknięte. Wymuszenie przez skipWaiting bez powiadomienia użytkownika daje pół starej, pół nowej aplikacji."
+    },
+    {
+      "key": "db-update-locking",
+      "category": "performance",
+      "project": "kamar",
+      "severity": "important",
+      "content": "Masowy UPDATE bez indeksu na kolumnie z warunku blokuje tabelę zamówień na czas trwania transakcji. Przy imporcie danych to widać jako losowe timeouty w kasie."
+    },
+    {
+      "key": "error-budget-alerts",
+      "category": "deployment",
+      "project": "kamar",
+      "severity": "info",
+      "content": "Alert ma opisywać skutek dla użytkownika, nie metrykę. „Error rate 2%\" nikogo nie budzi; „co pięćdziesiąte zamówienie nie dochodzi\" budzi natychmiast."
+    },
+    {
+      "key": "i18n-date-format",
+      "category": "i18n",
+      "project": "vs-beauty",
+      "severity": "info",
+      "content": "Format daty bierzemy z locale przeglądarki, nie z konfiguracji serwera. Inaczej użytkownik w innej strefie widzi datę usługi przesuniętą o dzień."
+    },
+    {
+      "key": "cache-key-versioning",
+      "category": "performance",
+      "project": "kanarix",
+      "severity": "important",
+      "content": "Klucz cache musi zawierać wersję schematu danych. Bez tego wdrożenie zmieniające kształt odpowiedzi serwuje stare rekordy do wygaśnięcia TTL, a wygląda to jak błąd zapisu."
     }
   ]
 }

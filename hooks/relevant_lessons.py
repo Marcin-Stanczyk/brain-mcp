@@ -256,6 +256,12 @@ def search(prompt, project, exclude):
 
     # The stems the retrievers matched on, so a lesson found through an inflected
     # form counts the word it actually shares rather than being penalised twice.
+    # NOTE: matching on roots is what lets `zamówieniach` reach `zamówień`, and
+    # also what lets `napisz` (write) reach `napis` (a caption). Requiring at
+    # least one WHOLE word as well was tried and measured: it cost recall@3
+    # 87.7% → 77.2% on the judged set and removed none of the junk on the real
+    # base, so the collision is not reachable from here. A real Polish stemmer
+    # would be, at the price of a dependency these hooks deliberately avoid.
     stems = [w[:5] if len(w) >= 6 else w for w in bd.fts_terms(prompt)]
     floor = min(MAX_COVERAGE_FLOOR,
                 max(MIN_COVERED_TERMS, math.ceil(len(stems) * MIN_COVERAGE_RATIO)))

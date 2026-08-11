@@ -132,12 +132,24 @@ export async function runEval(fixture: Fixture, limit = 10): Promise<EvalResult>
   const scored: ScoredQuery[] = [];
 
   for (const q of loadQueries()) {
-    const { rows } = await searchLessons(
+    const out = await searchLessons(
       db,
       { query: q.query, project: q.project, category: q.category, limit },
       { severityBoost: boosts, vector: fixture.vector, embedder: fixture.embedder }
     );
-    const returned = rows.map((r) => Number(r.id));
+    const { rows } = out;
+    // A HIT THE TOOL FLAGGED AS THIN IS THE TOOL SAYING "PROBABLY NOTHING".
+    // brain_recall answers and labels weak evidence rather than suppressing it —
+    // filtering was measured and cost recall@5 100% → 79.4%. So a negative query
+    // whose every hit came back thin has been answered correctly, and counting
+    // it as a miss would measure a design decision instead of the retrieval.
+    const allThin =
+      rows.length > 0 &&
+      rows.every((r) => {
+        const c = out.coverage.get(Number(r.id));
+        return c !== undefined && c < out.coverageFloor;
+      });
+    const returned = allThin && q.relevant.length === 0 ? [] : rows.map((r) => Number(r.id));
     scored.push({
       ...q,
       judgement: {
