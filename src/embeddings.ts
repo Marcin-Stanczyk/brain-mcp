@@ -47,10 +47,18 @@ export const DEFAULT_EMBEDDINGS_TIMEOUT_MS = 10000;
 
 /**
  * How long the backend should keep the model in memory after a request.
- * Ollama unloads after five minutes by default, so without this every quiet
- * spell is followed by a cold start on somebody's next question.
+ *
+ * Deliberately SHORT. The model is resident in RAM for this entire window with
+ * nobody asking it anything, and it is shared: every Claude Code session on the
+ * machine drives it through the hooks, so "nobody is working" never coincides
+ * with any one session ending. Two minutes means a laptop left alone gets its
+ * memory back on its own.
+ *
+ * Measured on bge-m3 (634 MB resident): warm request 0.17 s, first request
+ * after an unload 1.93 s. So the whole cost of the short window is ~1.8 s once,
+ * on the first question after a real break — not per question.
  */
-export const KEEP_ALIVE = "30m";
+export const KEEP_ALIVE = "2m";
 
 /**
  * Read embeddings config from the environment.

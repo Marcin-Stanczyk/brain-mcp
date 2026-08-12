@@ -136,7 +136,7 @@ def embed(text, cfg=None, timeout=DEFAULT_TIMEOUT_S):
     if not cfg or not text or breaker_open():
         return None
     body = json.dumps({
-        "model": cfg["model"], "prompt": str(text), "keep_alive": "30m",
+        "model": cfg["model"], "prompt": str(text), "keep_alive": "2m",
     }).encode()
     req = urllib.request.Request(
         f"{cfg['url']}/api/embeddings", data=body,
