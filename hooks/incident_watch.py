@@ -49,19 +49,19 @@ STATE_DIR = bd.STATE_DIR
 
 # High-precision undo signals. Each entry: (label, regex, what it usually means)
 REVERT_PATTERNS = [
-    ("git-checkout-file", r"\bgit\s+checkout\s+(--\s|--theirs|--ours|HEAD\s+--)",
+    ("git-checkout-file", r"git\s+checkout\s+(--\s|--theirs|--ours|HEAD\s+--)",
      "discarded working-tree changes"),
-    ("git-restore", r"\bgit\s+restore\b", "discarded working-tree changes"),
-    ("git-reset-hard", r"\bgit\s+reset\s+--hard\b", "threw away commits or changes"),
-    ("git-revert", r"\bgit\s+revert\b", "reverted a commit"),
-    ("git-clean", r"\bgit\s+clean\s+-[a-z]*f", "deleted untracked files"),
-    ("git-stash-drop", r"\bgit\s+stash\s+(drop|clear)\b", "discarded stashed work"),
-    ("git-amend", r"\bgit\s+commit\b.*--amend", "rewrote a commit that was wrong"),
+    ("git-restore", r"git\s+restore\b", "discarded working-tree changes"),
+    ("git-reset-hard", r"git\s+reset\s+--hard\b", "threw away commits or changes"),
+    ("git-revert", r"git\s+revert\b", "reverted a commit"),
+    ("git-clean", r"git\s+clean\s+-[a-z]*f", "deleted untracked files"),
+    ("git-stash-drop", r"git\s+stash\s+(drop|clear)\b", "discarded stashed work"),
+    ("git-amend", r"git\s+commit\b.*--amend", "rewrote a commit that was wrong"),
     # Only a backup used as SOURCE is an undo. See restored_from_backup below —
     # this one is a function rather than a regex, because two regex attempts at it
     # both produced false alarms on the most cautious thing anybody does.
     ("restore-backup", None, "restored from a backup"),
-    ("rebase-abort", r"\bgit\s+rebase\s+--abort\b", "abandoned a rebase"),
+    ("rebase-abort", r"git\s+rebase\s+--abort\b", "abandoned a rebase"),
 ]
 
 MAX_FAILS_BEFORE_INCIDENT = 2
@@ -128,6 +128,39 @@ def restored_from_backup(cmd: str) -> bool:
         if _TEMP_DEST.match(operands[-1].strip('"\'')):
             continue
         return True
+    return False
+
+
+def runs_command(scan: str, pattern: str) -> bool:
+    """True when `pattern` matches a command the shell would actually RUN.
+
+    A POSITIONAL QUESTION SOLVED TEXTUALLY IS THE FAILURE MODE OF THIS FILE.
+    `re.search` over the whole command asks "does this text appear anywhere",
+    when the question is "is this the command being executed". Observed on
+    2026-08-12: a diagnostic that merely printed the words `git checkout -- po
+    mutacji` inside an `echo` string was reported as an undo. Same shape as the
+    backup/restore confusion that took two regex attempts to get right — and
+    `restored_from_backup` already solved it by looking at where the operand
+    sits, not at whether the text is present.
+
+    So the match has to begin a segment: the start of the command, or just
+    after `&&`, `||`, `;`, `|`, or a newline. Leading assignments and wrappers
+    (`sudo`, `env FOO=1`) are stepped over, because those still run it.
+    """
+    for segment in _SEGMENT.split(scan):
+        stripped = segment.strip()
+        # Step over `FOO=bar` prefixes and wrappers that still execute what follows.
+        while True:
+            head = stripped.split(maxsplit=1)
+            if len(head) < 2:
+                break
+            if _ASSIGN.match(head[0]) or head[0] in ("sudo", "command", "env", "time", "nohup"):
+                stripped = head[1].lstrip()
+                continue
+            break
+        m = re.match(pattern, stripped)
+        if m:
+            return True
     return False
 
 
@@ -235,7 +268,7 @@ def main():
     # --- signal 1: an undo ran (prompt immediately) ---
     scan = strip_heredocs(cmd)
     for label, pattern, meaning in REVERT_PATTERNS:
-        hit = restored_from_backup(scan) if pattern is None else re.search(pattern, scan)
+        hit = restored_from_backup(scan) if pattern is None else runs_command(scan, pattern)
         if hit:
             append(sid, {"kind": "revert", "label": label, "cmd": cmd,
                          "meaning": meaning})

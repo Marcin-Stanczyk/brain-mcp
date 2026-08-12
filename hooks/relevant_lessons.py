@@ -55,6 +55,12 @@ BOOST_SAME_PROJECT = 2.0
 BOOST_GLOBAL_SCOPE = 1.0
 BOOST_SEVERITY = {"critical": 1.5, "important": 0.75, "high": 0.75}
 
+# Subtracted per extra recording, bounded. A trap written down three times is
+# evidence that reading it once did not stop it — and unlike severity it is an
+# observed fact rather than the author's impression. See src/recurrence.ts.
+BOOST_PER_RECURRENCE = 0.6
+MAX_RECURRENCE_BOOST = 1.8
+
 # Added (bm25 is lower-is-better) to anything only the stem query found, so a
 # morphological match can fill a slot but never take one from an exact match.
 PREFIX_PENALTY = 2.0
@@ -237,6 +243,22 @@ def search(prompt, project, exclude):
             LIMIT 60
             """
         rows = con.execute(sql, (query,)).fetchall()
+        # Counted by following the `repeats` links a writer stated, not by
+        # similarity — deriving it from nearest neighbours was measured and
+        # abandoned (see src/recurrence.ts). Chains are two or three long, and
+        # a base written before the column existed simply reports nothing.
+        try:
+            repeats_of = dict(con.execute(
+                "SELECT id, repeats FROM lessons WHERE repeats IS NOT NULL"
+            ).fetchall())
+        except Exception:
+            repeats_of = {}
+        recurrence_of = {}
+        for lid in repeats_of:
+            seen, n, at = {lid}, 1, lid
+            while at in repeats_of and repeats_of[at] not in seen:
+                at = repeats_of[at]; seen.add(at); n += 1
+            recurrence_of[lid] = n
 
         # A SECOND PASS OVER STEMS, NOT A REPLACEMENT FOR THE FIRST.
         # `zamówieniach` in the prompt and `zamówienia` in the lesson are one
@@ -284,6 +306,8 @@ def search(prompt, project, exclude):
         if scope == "global":
             score -= BOOST_GLOBAL_SCOPE
         score -= BOOST_SEVERITY.get(sev, 0.0)
+        score -= min(MAX_RECURRENCE_BOOST,
+                     max(0, (recurrence_of.get(lid, 1) - 1)) * BOOST_PER_RECURRENCE)
         scored.append((score, lid, cat, content, sev, proj))
 
     scored.sort(key=lambda r: r[0])

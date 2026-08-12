@@ -12,6 +12,7 @@
 import type Database from "better-sqlite3";
 import { rrfFuse, similarityFromDistance, type Embedder, type RankedList } from "./embeddings.js";
 import { planFtsQuery, stemForPrefix } from "./query.js";
+import { recurrenceBoost, recurrenceOf } from "./recurrence.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Ranking policy ──────────────────────────────────────────────────────────
@@ -100,6 +101,8 @@ export const MIN_VECTOR_SIMILARITY = Number(process.env.BRAIN_MIN_SIMILARITY) ||
 
 export interface LessonRow {
   id: number;
+  /** Id of the earlier lesson this one repeats, or null. */
+  repeats?: number | null;
   content: string;
   category: string;
   tags: string | null;
@@ -160,7 +163,7 @@ export interface SearchOutcome {
 }
 
 const ROW_COLUMNS =
-  "l.id, l.content, l.category, l.tags, l.project, l.source, l.severity, l.scope, l.created_at";
+  "l.id, l.content, l.category, l.tags, l.project, l.source, l.severity, l.scope, l.repeats, l.created_at";
 
 /**
  * SEVERITY BOOSTS DERIVED FROM THE BASE, NOT FROM A CONSTANT.
@@ -412,6 +415,12 @@ export async function searchLessons(
     let score = hit.score;
     score *= severityBoost[String(row?.severity ?? "")] ?? 1;
     if (String(row?.scope ?? "project") === "global") score *= SCOPE_GLOBAL_BOOST;
+    // A trap somebody recorded for the third time is evidence that reading it
+    // once did not stop it. Counted by following the `repeats` links a writer
+    // stated, not by similarity — see src/recurrence.ts for the measurement
+    // that ruled the automatic version out. Only rows that claim a repeat pay
+    // for the lookup, and the chains are two or three long.
+    if (row?.repeats) score *= recurrenceBoost(recurrenceOf(db, Number(row.id)));
     return { ...hit, score };
   });
   boosted.sort(

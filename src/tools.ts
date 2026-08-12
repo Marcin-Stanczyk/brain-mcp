@@ -15,6 +15,7 @@ import type { Embedder, EmbeddingsConfig } from "./embeddings.js";
 import { searchLessons, severityBoosts } from "./search.js";
 import { scopeCandidates, applyGlobalScope } from "./scope.js";
 import { ensureChunks, reindexLessonChunks, removeLessonChunks, rebuildAllChunks, CHUNK_MAX } from "./chunk.js";
+import { suggestRecurrence, recurrenceOf } from "./recurrence.js";
 import type { VectorIndex } from "./vector.js";
 
 // ── Database Setup ──────────────────────────────────────────────────────────
@@ -47,7 +48,12 @@ export function initDB(dbPath: string): Database.Database {
       last_shown_at TEXT,
       -- 'project' | 'global'. A lesson about a TOOL rather than a project —
       -- a bash trap, a git behaviour, an API limit — belongs everywhere.
-      scope TEXT NOT NULL DEFAULT 'project'
+      scope TEXT NOT NULL DEFAULT 'project',
+      -- The earlier lesson this one repeats, stated by whoever wrote it. The
+      -- COUNT is derived from following these links, not from similarity —
+      -- see src/recurrence.ts for the measurement that killed the automatic
+      -- version. NULL means "not a repeat".
+      repeats INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS project_index (
@@ -154,6 +160,7 @@ export function initDB(dbPath: string): Database.Database {
     shown_count: "INTEGER NOT NULL DEFAULT 0",
     last_shown_at: "TEXT",
     scope: "TEXT NOT NULL DEFAULT 'project'",
+    repeats: "INTEGER",
   };
   for (const [name, decl] of Object.entries(LATE_COLUMNS)) {
     if (!existing.has(name)) db.exec(`ALTER TABLE lessons ADD COLUMN ${name} ${decl}`);
@@ -470,13 +477,20 @@ export function createTools(
         "the ranking boost is derived from how rare a label is, so inflating it " +
         "does not promote your lesson, it demotes everyone else's."
       ),
+      repeats: z.number().int().positive().optional().describe(
+        "Id of an earlier lesson recording the SAME trap. Sets this lesson's " +
+        "recurrence count to that lesson's plus one, and raises it in future " +
+        "searches. Use it when you recognise a mistake the base already knows — " +
+        "'this is the third time' is the part a reader acts on, and severity " +
+        "cannot carry it: severity is what the writer felt, this is what happened."
+      ),
       scope: z.enum(["project", "global"]).optional().default("project").describe(
         "'global' for a lesson about a TOOL rather than a project — a shell trap, a git " +
         "behaviour, an API limit. Those recur everywhere, and filing them under whichever " +
         "project happened to be open is what made them invisible where the mistake repeats."
       ),
     },
-    handler: async ({ content, category, tags, project, source, severity, scope }: {
+    handler: async ({ content, category, tags, project, source, severity, scope, repeats }: {
       content: string;
       category: string;
       tags?: string[];
@@ -484,6 +498,7 @@ export function createTools(
       source?: string;
       severity?: string;
       scope?: string;
+      repeats?: number;
     }): Promise<TextResult> => {
       // Auto-detect project from tags if not explicitly provided
       let resolvedProject = project || null;
@@ -499,8 +514,8 @@ export function createTools(
       }
 
       const stmt = db.prepare(`
-        INSERT INTO lessons (content, category, tags, project, source, severity, scope)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO lessons (content, category, tags, project, source, severity, scope, repeats)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const result = stmt.run(
@@ -510,7 +525,8 @@ export function createTools(
         resolvedProject,
         source || null,
         severity || "info",
-        scope || "project"
+        scope || "project",
+        repeats ?? null
       );
 
       // The passage index is not maintained by a trigger — splitting prose is
@@ -520,8 +536,22 @@ export function createTools(
       // Optional: embed on write. Failure never blocks the save — the lesson
       // stays unembedded and brain_reindex can pick it up later.
       let embedNote = "";
+      let repeatNote = repeats
+        ? `\n\n🔁 Recorded as recurrence #${recurrenceOf(db, Number(result.lastInsertRowid))} of the trap in #${repeats}.`
+        : "";
       if (hybridEnabled) {
         const ok = await embedLesson(Number(result.lastInsertRowid));
+        // A SUGGESTION, NEVER A WRITE. See src/recurrence.ts: counting
+        // recurrences from similarity was measured and abandoned.
+        if (ok && repeats === undefined) {
+          const hint = suggestRecurrence(db, vector, Number(result.lastInsertRowid));
+          if (hint) {
+            repeatNote =
+              `\n\n🔁 This looks like #${hint.ofLesson} (similarity ${hint.similarity.toFixed(2)}). ` +
+              `If it is the SAME trap rather than the same area, record it again with ` +
+              `repeats: ${hint.ofLesson} — the count is only worth having when somebody checked.`;
+          }
+        }
         embedNote = ok ? "\nEmbedded: yes" : "\nEmbedded: no (endpoint unavailable — run brain_reindex later)";
       }
 
@@ -529,7 +559,7 @@ export function createTools(
         content: [
           {
             type: "text" as const,
-            text: `✅ Lesson #${result.lastInsertRowid} stored [${category}] ${severity === "critical" ? "⚠️ CRITICAL" : ""}\n\nTags: ${(tags || []).join(", ") || "none"}\nProject: ${project || "general"}${embedNote}\n\n"${content.slice(0, 100)}${content.length > 100 ? "…" : ""}"`,
+            text: `✅ Lesson #${result.lastInsertRowid} stored [${category}] ${severity === "critical" ? "⚠️ CRITICAL" : ""}\n\nTags: ${(tags || []).join(", ") || "none"}\nProject: ${project || "general"}${embedNote}${repeatNote}\n\n"${content.slice(0, 100)}${content.length > 100 ? "…" : ""}"`,
           },
         ],
       };
@@ -606,6 +636,11 @@ export function createTools(
 
       const formatted = (results as Record<string, unknown>[]).map((r) => {
         const sev = r.severity === "critical" ? "🔴" : r.severity === "important" ? "🟡" : "🔵";
+        // Said out loud, because "this is the third time" is the part a reader
+        // acts on, and the prose version — #267 opens by stating it — was
+        // never something a query could count.
+        const times = r.repeats ? recurrenceOf(db, Number(r.id)) : 1;
+        const repeat = times > 1 ? ` 🔁 ${times}× recorded` : "";
         const via = matchedBy?.get(Number(r.id));
         const viaNote = via ? ` | matched: ${via.join("+")}` : "";
 
@@ -632,7 +667,7 @@ export function createTools(
           ? ` | thin: ${cov}/${searchedTerms.length} terms`
           : "";
 
-        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}\n${body}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}${thin}`;
+        return `${sev} #${r.id} [${r.category}] ${r.project ? `(${r.project})` : ""}${repeat}\n${body}\n${r.tags ? `Tags: ${r.tags}` : ""} | ${r.created_at}${viaNote}${thin}`;
       }).join("\n\n---\n\n");
 
       // When EVERY hit is thin the base probably has nothing on this, and the

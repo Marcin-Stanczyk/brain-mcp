@@ -53,6 +53,7 @@ MCP client (VS Code Copilot Chat, Claude Code, ...)
 | `src/search.ts` | Retrieval — runs the retrievers, fuses them, returns rows (no formatting) |
 | `src/chunk.ts` | Splits lessons into passages and keeps that index in step |
 | `src/scope.ts` | Proposes lessons that are about a tool rather than a project |
+| `src/recurrence.ts` | Counts how often a trap has been recorded, from links a writer stated |
 | `src/metrics.ts` | recall@k, precision@k, MRR — so ranking changes produce numbers |
 | `src/preflight.ts` | Turns a startup crash (ABI mismatch, missing module) into instructions |
 | `src/backfill.ts` | Embeds the vector backlog on startup, without blocking the transport |
@@ -595,6 +596,37 @@ turning a dead backend into a thousand timeouts. "Run `brain_reindex`" is a fine
 repair and a poor design: it needs somebody to notice, and the symptom of not
 noticing is that some lessons are quietly unreachable by meaning while every
 report says healthy.
+
+### When the same trap comes back
+
+A trap recorded three times is evidence that reading it once did not stop it,
+and this base contains several: `git checkout --` after a mutation test appears
+three times, and one of those lessons opens by *saying* it is the third — in
+prose no query could count.
+
+`brain_learn` takes `repeats: <id>` for that. The count follows the chain of
+links and raises the lesson in future searches (bounded at ×1.3), and the result
+shows `🔁 3× recorded`.
+
+**Not severity, and not automatic — both were measured.** Escalating repeats to
+`critical` is self-defeating: the severity boost is inverse-frequency, so raising
+the share of `critical` lowers the boost for everything including the repeat.
+And counting recurrences from embedding similarity does not work at all, because
+similarity is not transitive:
+
+```
+threshold 0.68 → largest cluster 205 lessons of 364     meaningless
+threshold 0.75 → 28
+threshold 0.85 → 3, and the known repeats (0.708–0.751) drop out entirely
+```
+
+There is no threshold that catches the repeats this base actually contains and
+still says anything, and a chain-following counter was not even idempotent — it
+reported most of the base as a fourth occurrence, twice in a row. So the count
+is a claim somebody made and a reader can check. The detector still runs, purely
+to offer the pointer: *"this looks like #267 (similarity 0.87) — if it is the
+same trap, record it with repeats: 267"*. A wrong suggestion costs a sentence; a
+wrong count is a claim about history nobody can verify.
 
 ### Tuning the similarity floor
 

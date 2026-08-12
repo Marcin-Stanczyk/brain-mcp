@@ -805,6 +805,47 @@ class TestHookSemanticSearch(unittest.TestCase):
             con.close()
 
 
+class TestRevertDetectionIsPositional(unittest.TestCase):
+    """Mentioning an undo is not running one.
+
+    `re.search` over the whole command asks "does this text appear anywhere",
+    when the question is "is this the command being executed". Observed on
+    2026-08-12: a diagnostic that printed the words `git checkout -- po mutacji`
+    inside an `echo` was reported as an undo, and the Stop hook then asked for a
+    lesson about a mistake that never happened. Same shape as the
+    backup/restore confusion, which took two regex attempts before somebody
+    looked at WHERE the operand sits rather than whether the text is present.
+    """
+
+    def setUp(self):
+        import incident_watch
+        self.iw = incident_watch
+
+    def _detects(self, cmd):
+        scan = self.iw.strip_heredocs(cmd)
+        return any(self.iw.runs_command(scan, p)
+                   for _label, p, _meaning in self.iw.REVERT_PATTERNS if p)
+
+    def test_talking_about_an_undo_is_not_an_undo(self):
+        for cmd in [
+            'echo "=== git checkout -- po mutacji ==="',
+            "python3 -c \"print('git reset --hard')\"",
+            'grep -n "git checkout" agent-worktrees.sh',
+            'printf "%s\\n" "git clean -fd is dangerous"',
+        ]:
+            self.assertFalse(self._detects(cmd), cmd)
+
+    def test_an_undo_is_still_detected_wherever_the_shell_runs_it(self):
+        for cmd in [
+            "git checkout -- src/plik.php",
+            "cd /repo && git reset --hard origin/main",
+            "agent-browser close --all; git checkout -- x.ts",
+            "sudo git clean -fd",
+            "FOO=1 git revert abc123",
+        ]:
+            self.assertTrue(self._detects(cmd), cmd)
+
+
 class TestRestoreIntoTempIsNotAnIncident(unittest.TestCase):
     """A restore that only touches /tmp undoes nothing worth a lesson.
 

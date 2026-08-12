@@ -40,6 +40,10 @@ EXTRA_COLUMNS = {
     # would actually recur. Relevance search crosses projects anyway; this lets a
     # lesson say outright that it is not about one.
     "scope": "TEXT NOT NULL DEFAULT 'project'",
+    # The earlier lesson this one repeats, stated by whoever wrote it. The count
+    # is derived by following these links; deriving it from similarity was
+    # measured and abandoned — see src/recurrence.ts.
+    "repeats": "INTEGER",
 }
 
 
