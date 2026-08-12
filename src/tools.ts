@@ -1206,9 +1206,18 @@ export function createTools(
       // backend that most installs do not run.
       let chunkNote = "";
       try {
-        chunkNote = `🧩 Passage index rebuilt: ${rebuildAllChunks(db)} passages across ${
+        const rebuilt = rebuildAllChunks(db, vector);
+        chunkNote = `🧩 Passage index rebuilt: ${rebuilt.passages} passages across ${
           (db.prepare("SELECT COUNT(*) AS c FROM lessons").get() as { c: number }).c
         } lessons.\n`;
+        // Never silently: rebuilding gives every passage a new id, so vectors
+        // that could not be dropped now point at rows nobody can read.
+        if (!rebuilt.didClear) {
+          chunkNote +=
+            `⚠️ ${rebuilt.strandedVectors} vector(s) were left pointing at passages that no longer ` +
+            `exist — the sqlite-vec extension is not loaded here, so they could not be dropped. ` +
+            `Semantic search is now detached until this runs again with the extension available.\n`;
+        }
       } catch (err) {
         chunkNote = `⚠️ Passage index could not be rebuilt (${err instanceof Error ? err.message : String(err)}).\n`;
       }

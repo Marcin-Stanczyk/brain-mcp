@@ -166,13 +166,46 @@ export function removeLessonChunks(
 
 /**
  * Rebuild every passage from scratch. Idempotent, and the repair for any write
- * path that forgot to reindex — which, unlike a trigger, is a thing that can
- * happen. Returns the number of passages written.
+ * path that forgot to reindex. Returns the number of passages written.
+ *
+ * EVERY PASSAGE GETS A NEW ID, SO EVERY VECTOR IS ORPHANED. That was true from
+ * the day this was written and was survivable only because its one production
+ * caller happened to call pruneOrphans fourteen lines later — with two `return`
+ * statements in between. A server with embeddings switched off returned at the
+ * first of them, having just detached the whole semantic index, and said
+ * "Embeddings are disabled" as though nothing had happened.
+ *
+ * Found by a peer session's recipe rather than by reading: take a function with
+ * a warning comment, count its call sites, count how many carry the matching
+ * guard. Fewer than all is a candidate without understanding the logic.
+ *
+ * `didClear` is false when vectors exist and could not be dropped — the
+ * sqlite-vec extension is not loaded, so the vec0 table cannot be touched. The
+ * caller must say so out loud; silence there is the failure this comment is
+ * about.
  */
-export function rebuildAllChunks(db: Database.Database): number {
+export function rebuildAllChunks(
+  db: Database.Database,
+  vector?: VectorIndex | null
+): { passages: number; didClear: boolean; strandedVectors: number } {
   const rows = db.prepare("SELECT id, content FROM lessons").all() as
     { id: number; content: string }[];
   const add = db.prepare("INSERT INTO lesson_chunks (lesson_id, ord, text) VALUES (?, ?, ?)");
+
+  // How many vectors are about to lose the passages they hang off.
+  let stranded = 0;
+  try {
+    stranded = (db.prepare("SELECT COUNT(*) AS c FROM chunk_embeddings").get() as { c: number }).c;
+  } catch { /* no vector bookkeeping in this base */ }
+
+  let didClear = stranded === 0;
+  if (stranded && vector) {
+    try {
+      vector.clear();
+      didClear = true;
+    } catch { /* reported to the caller as didClear=false */ }
+  }
+
   let total = 0;
   const write = db.transaction(() => {
     db.exec("DELETE FROM lesson_chunks");
@@ -184,7 +217,7 @@ export function rebuildAllChunks(db: Database.Database): number {
     }
   });
   write();
-  return total;
+  return { passages: total, didClear, strandedVectors: didClear ? 0 : stranded };
 }
 
 /**

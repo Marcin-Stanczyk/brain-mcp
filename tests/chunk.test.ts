@@ -140,8 +140,8 @@ test("an archived lesson stops being reachable through its passages", async () =
 });
 
 test("rebuilding is idempotent and repairs a write path that forgot", () => {
-  const total = rebuildAllChunks(db);
-  assert.equal(rebuildAllChunks(db), total, "twice is the same as once");
+  const total = rebuildAllChunks(db).passages;
+  assert.equal(rebuildAllChunks(db).passages, total, "twice is the same as once");
 
   // Simulate the failure mode the rebuild exists for: a row written straight to
   // the table, the way an import or a migration would.
@@ -253,6 +253,45 @@ test("rewriting a lesson does not strand its vectors", async () => {
   }
   reindexLessonChunks(fresh, id, PROBLEM_THEN_FIX + "\n\nANOTHER — one more.", vec);
   assert.equal(vec!.pruneOrphans(), 0, "the ordering is enforced, not remembered");
+  fresh.close();
+});
+
+test("a full rebuild never strands vectors, and says so when it cannot help it", async () => {
+  // THE THIRD CALL SITE, FOUND BY A RECIPE RATHER THAN BY READING.
+  // Take a function with a warning comment, count its call sites, count how
+  // many carry the matching guard. rebuildAllChunks gives every passage a new
+  // id, so every vector is orphaned — and its one production caller pruned them
+  // fourteen lines later, with two `return` statements in between. A server
+  // with embeddings switched off returned at the first, having just detached
+  // the whole semantic index, and reported "Embeddings are disabled".
+  const fresh = initDB(join(workDir, "rebuild.db"));
+  const vec = await loadVectorIndex(fresh);
+  assert.ok(vec);
+
+  const id = Number(
+    fresh.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
+      .run(PROBLEM_THEN_FIX).lastInsertRowid
+  );
+  reindexLessonChunks(fresh, id, PROBLEM_THEN_FIX);
+  const unit = Float32Array.from({ length: 8 }, (_, i) => (i === 0 ? 1 : 0));
+  for (const c of fresh.prepare("SELECT id FROM lesson_chunks").all() as { id: number }[]) {
+    vec!.upsert(c.id, unit, "m");
+  }
+  assert.ok(vec!.embeddedCount() > 0);
+
+  const withIndex = rebuildAllChunks(fresh, vec);
+  assert.equal(withIndex.didClear, true);
+  assert.equal(vec!.pruneOrphans(), 0, "nothing was left hanging");
+
+  // Without the index — the shape of a server running with embeddings off. It
+  // cannot drop them, and the contract is that it must SAY so rather than
+  // return quietly.
+  for (const c of fresh.prepare("SELECT id FROM lesson_chunks").all() as { id: number }[]) {
+    vec!.upsert(c.id, unit, "m");
+  }
+  const blind = rebuildAllChunks(fresh, null);
+  assert.equal(blind.didClear, false, "it knows it could not clean up");
+  assert.ok(blind.strandedVectors > 0, "and how many it left behind");
   fresh.close();
 });
 
