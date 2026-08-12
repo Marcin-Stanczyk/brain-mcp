@@ -27,6 +27,7 @@
 // when it finds the table empty against a non-empty base.
 
 import type Database from "better-sqlite3";
+import type { VectorIndex } from "./vector.js";
 
 /** Below this, a lesson is one passage and splitting it would only add noise. */
 export const CHUNK_MIN = 400;
@@ -110,17 +111,34 @@ function lastSentenceEnd(text: string, min: number): number | null {
 
 // ── Index maintenance ───────────────────────────────────────────────────────
 
-/** Rewrite the passages for one lesson. Call after any content change. */
+/**
+ * Rewrite the passages for one lesson. Call after any content change.
+ *
+ * PASS THE VECTOR INDEX. New passages get new ids, so the old vectors are
+ * orphaned the moment the old rows go — and an orphan is not harmless: it is a
+ * vector that still answers KNN for a passage nobody can read, which the
+ * retriever then skips silently as "stale". The hazard was understood and
+ * written down at ONE call site (brain_forget: "ORDER MATTERS"), and a comment
+ * at one call site does not travel to the next one. Measured on the live base
+ * on 2026-08-12: 4 orphaned vectors, and nothing in the project looked for
+ * them. So the ordering is enforced here rather than remembered by callers.
+ */
 export function reindexLessonChunks(
   db: Database.Database,
   lessonId: number,
-  content: string
+  content: string,
+  vector?: VectorIndex | null
 ): number {
   const remove = db.prepare("DELETE FROM lesson_chunks WHERE lesson_id = ?");
   const add = db.prepare(
     "INSERT INTO lesson_chunks (lesson_id, ord, text) VALUES (?, ?, ?)"
   );
   const chunks = splitIntoChunks(content);
+  // Before the rows go, not after: removeByLesson finds the vectors by joining
+  // through the very passages this is about to delete.
+  if (vector) {
+    try { vector.removeByLesson([lessonId]); } catch { /* index optional */ }
+  }
   const write = db.transaction(() => {
     remove.run(lessonId);
     chunks.forEach((text, i) => add.run(lessonId, i, text));
@@ -130,8 +148,15 @@ export function reindexLessonChunks(
 }
 
 /** Drop the passages of lessons that no longer exist, or were archived. */
-export function removeLessonChunks(db: Database.Database, lessonIds: readonly number[]): void {
+export function removeLessonChunks(
+  db: Database.Database,
+  lessonIds: readonly number[],
+  vector?: VectorIndex | null
+): void {
   if (!lessonIds.length) return;
+  if (vector) {
+    try { vector.removeByLesson(lessonIds); } catch { /* index optional */ }
+  }
   const remove = db.prepare("DELETE FROM lesson_chunks WHERE lesson_id = ?");
   const run = db.transaction((ids: readonly number[]) => {
     for (const id of ids) remove.run(id);

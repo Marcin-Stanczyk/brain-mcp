@@ -22,6 +22,7 @@ import { join } from "path";
 import type Database from "better-sqlite3";
 import { initDB, createTools, type ToolDef } from "../src/tools.js";
 import { searchLessons } from "../src/search.js";
+import { loadVectorIndex } from "../src/vector.js";
 import {
   splitIntoChunks, reindexLessonChunks, removeLessonChunks,
   rebuildAllChunks, ensureChunks, CHUNK_MAX, CHUNK_MIN,
@@ -216,6 +217,42 @@ test("ensureChunks builds a missing index and leaves a present one alone", () =>
     built,
     "a fully covered base is not rebuilt behind the caller's back"
   );
+  fresh.close();
+});
+
+test("rewriting a lesson does not strand its vectors", async () => {
+  // THE HAZARD WAS DOCUMENTED AT ONE CALL SITE AND ENFORCED AT NONE.
+  // brain_forget carried an "ORDER MATTERS" comment explaining that vectors are
+  // keyed by passage and can only be found by joining through the rows about to
+  // be deleted. A comment at one call site does not travel to the next: measured
+  // on the live base on 2026-08-12 there were 4 orphaned vectors, and nothing in
+  // the project looked for them. An orphan still answers KNN, for text nobody
+  // can read, which the retriever then skips silently as "stale".
+  const fresh = initDB(join(workDir, "orphans.db"));
+  const vec = await loadVectorIndex(fresh);
+  assert.ok(vec, "sqlite-vec loads on this platform");
+
+  const id = Number(
+    fresh.prepare("INSERT INTO lessons (content, category, tags) VALUES (?, 'gotcha', '[]')")
+      .run(PROBLEM_THEN_FIX).lastInsertRowid
+  );
+  reindexLessonChunks(fresh, id, PROBLEM_THEN_FIX);
+  const unit = Float32Array.from({ length: 8 }, (_, i) => (i === 0 ? 1 : 0));
+  for (const c of fresh.prepare("SELECT id FROM lesson_chunks WHERE lesson_id = ?").all(id) as { id: number }[]) {
+    vec!.upsert(c.id, unit, "m");
+  }
+  assert.ok(vec!.embeddedCount() > 0);
+
+  // Rewritten WITHOUT the index: the old vectors have nothing left to hang off.
+  reindexLessonChunks(fresh, id, PROBLEM_THEN_FIX + "\n\nEXTRA — a new paragraph.");
+  assert.ok(vec!.pruneOrphans() > 0, "this is the failure the ordering exists to prevent");
+
+  // Rewritten WITH it: nothing is stranded, and no prune is needed.
+  for (const c of fresh.prepare("SELECT id FROM lesson_chunks WHERE lesson_id = ?").all(id) as { id: number }[]) {
+    vec!.upsert(c.id, unit, "m");
+  }
+  reindexLessonChunks(fresh, id, PROBLEM_THEN_FIX + "\n\nANOTHER — one more.", vec);
+  assert.equal(vec!.pruneOrphans(), 0, "the ordering is enforced, not remembered");
   fresh.close();
 });
 

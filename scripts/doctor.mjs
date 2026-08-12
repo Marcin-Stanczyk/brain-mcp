@@ -231,6 +231,19 @@ if (!declaredUrl) {
       const embedded = Object.values(
         db.prepare("SELECT COUNT(*) FROM chunk_embeddings e JOIN lesson_chunks c ON c.id = e.chunk_id").get()
       )[0];
+      // A vector whose passage is gone still answers KNN, for text nobody can
+      // read; the retriever skips it silently as "stale". Nothing looked for
+      // these until 2026-08-12, when there were four.
+      let orphans = 0;
+      try {
+        orphans = Object.values(db.prepare(
+          "SELECT COUNT(*) FROM chunk_embeddings WHERE chunk_id NOT IN (SELECT id FROM lesson_chunks)"
+        ).get())[0];
+      } catch { /* no vector bookkeeping yet */ }
+      if (orphans > 0) {
+        warn(`${orphans} vector(s) point at passages that no longer exist — run brain_reindex to prune them`);
+      }
+
       if (embedded < chunks) {
         warn(
           `${chunks - embedded} of ${chunks} passages have no vector.\n` +

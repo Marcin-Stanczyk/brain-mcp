@@ -531,7 +531,7 @@ export function createTools(
 
       // The passage index is not maintained by a trigger — splitting prose is
       // not expressible in SQL — so every write path has to say so explicitly.
-      reindexLessonChunks(db, Number(result.lastInsertRowid), content);
+      reindexLessonChunks(db, Number(result.lastInsertRowid), content, vector);
 
       // Optional: embed on write. Failure never blocks the save — the lesson
       // stays unembedded and brain_reindex can pick it up later.
@@ -1121,19 +1121,11 @@ export function createTools(
       });
 
       const archivedIds = archiveAndDelete();
-      // ORDER MATTERS. The vectors are keyed by passage, so they can only be
-      // found by joining through lesson_chunks — dropping the passages first
-      // would strand every vector as an orphan.
-      if (vector && archivedIds.length) {
-        try {
-          vector.removeByLesson(archivedIds);
-        } catch (err) {
-          console.error(`⚠️ brain-mcp: failed to drop vectors for archived lessons (${err instanceof Error ? err.message : String(err)})`);
-        }
-      }
       // Without this an archived lesson stays reachable through its passages —
-      // soft-deleted from the list and still answering questions.
-      removeLessonChunks(db, archivedIds);
+      // soft-deleted from the list and still answering questions. The vectors
+      // go first; removeLessonChunks enforces that ordering itself now, rather
+      // than leaving it to each caller to remember.
+      removeLessonChunks(db, archivedIds, vector);
 
       return {
         content: [{ type: "text" as const, text: `📦 Archived ${archivedIds.length} lesson(s) → lessons_archive table.\nReason: ${reason}\n\nData is preserved and can be restored.` }],
@@ -1192,7 +1184,7 @@ export function createTools(
 
       // Restoring is the mirror of archiving, and archiving drops the passages.
       const back = db.prepare("SELECT content FROM lessons WHERE id = ?").get(id) as { content: string } | undefined;
-      if (back) reindexLessonChunks(db, id, back.content);
+      if (back) reindexLessonChunks(db, id, back.content, vector);
 
       return { content: [{ type: "text" as const, text: `✅ Restored lesson #${id} back to active lessons.` }] };
     },
@@ -1433,7 +1425,7 @@ export function createTools(
             l.data.severity ?? "info",
             l.data.created_at ?? null
           );
-          reindexLessonChunks(db, Number(info.lastInsertRowid), l.data.content);
+          reindexLessonChunks(db, Number(info.lastInsertRowid), l.data.content, vector);
           inserted++;
         }
         if (Array.isArray(parsed.patterns)) {
